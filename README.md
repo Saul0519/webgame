@@ -146,6 +146,22 @@ Durable Object 마이그레이션은 `v1` 태그로 정의돼 있고, SQLite 백
 
 **방법 B — GitHub Actions (`.github/workflows/deploy.yml` 이미 들어있음)**
 
+이 워크플로는 푸시마다 자동으로 돌고, 시크릿 유무에 따라 갈립니다.
+
+| 시크릿 | 동작 |
+| --- | --- |
+| 있음 | 내 Cloudflare 계정으로 배포. 주소 고정. |
+| 없음 | `wrangler deploy --temporary` 로 **로그인 없이** 임시 미리보기 계정에 배포하고, 주소와 claim 링크를 실행 요약(Summary)에 출력 |
+
+시크릿 없이도 일단 게임이 뜨는 게 목적입니다. 다만 임시 계정은:
+
+- **claim 링크로 60분 안에** 본인 계정으로 가져가지 않으면 사라집니다.
+- 푸시할 때마다 **새 임시 계정과 새 주소**가 생기고 이전 것은 만료됩니다.
+
+그러니 임시 배포는 부트스트랩용으로만 쓰고, 아래 시크릿 두 개를 넣어 고정 주소로 넘어가는 걸
+권장합니다. 넣는 순간 워크플로가 수정 없이 알아서 내 계정 경로로 전환됩니다.
+
+
 1. `dash.cloudflare.com` → 오른쪽 위 프로필 → **API Tokens** → **Create Token**
    → **Edit Cloudflare Workers** 템플릿 → 생성된 토큰 복사
 2. 같은 대시보드 Workers 페이지 오른쪽에서 **Account ID** 복사

@@ -54,7 +54,7 @@ export interface CharacterState {
   name: string;
 }
 
-function makeLabel(name: string): THREE.Sprite {
+function makeLabelTexture(name: string): THREE.CanvasTexture {
   const canvas = document.createElement('canvas');
   canvas.width = 512;
   canvas.height = 128;
@@ -70,7 +70,16 @@ function makeLabel(name: string): THREE.Sprite {
   ctx.fillText(name, 256, 64);
   const tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
-  const mat = new THREE.SpriteMaterial({ map: tex, depthTest: true, transparent: true, opacity: 0.92 });
+  return tex;
+}
+
+function makeLabel(name: string): THREE.Sprite {
+  const mat = new THREE.SpriteMaterial({
+    map: makeLabelTexture(name),
+    depthTest: true,
+    transparent: true,
+    opacity: 0.92,
+  });
   const sprite = new THREE.Sprite(mat);
   sprite.scale.set(1.1, 0.275, 1);
   return sprite;
@@ -92,6 +101,7 @@ export class CharacterModel {
   private readonly shinL = new THREE.Group();
   private readonly shinR = new THREE.Group();
   private readonly label: THREE.Sprite;
+  private labelText: string;
   private readonly trimMat: THREE.MeshStandardMaterial;
   private phase = 0;
   private smoothedYaw = 0;
@@ -107,11 +117,13 @@ export class CharacterModel {
     this.trimMat = shared.trim!.clone();
     this.trimMat.emissive = new THREE.Color(TRIM_COLOURS[playerId % TRIM_COLOURS.length]);
 
-    const mesh = (g: THREE.BufferGeometry, m: THREE.Material, y = 0, z = 0) => {
+    // Only the big silhouette parts cast shadows: small props doubled the draw
+    // call count for no visible gain, and characters never receive them.
+    const mesh = (g: THREE.BufferGeometry, m: THREE.Material, y = 0, z = 0, shadow = true) => {
       const mm = new THREE.Mesh(g, m);
       mm.position.set(0, y, z);
-      mm.castShadow = true;
-      mm.receiveShadow = true;
+      mm.castShadow = shadow;
+      mm.receiveShadow = false;
       return mm;
     };
 
@@ -121,12 +133,12 @@ export class CharacterModel {
 
     this.torso.position.set(0, 1.02, 0);
     this.torso.add(mesh(geo.torso, body, 0.3));
-    this.torso.add(mesh(geo.pack, this.trimMat, 0.3, -0.21));
+    this.torso.add(mesh(geo.pack, this.trimMat, 0.3, -0.21, false));
     this.root.add(this.torso);
 
     this.head.position.set(0, 0.68, 0);
     this.head.add(mesh(geo.head, body, 0.1));
-    const visor = mesh(geo.visor, this.trimMat, 0.11, 0.135);
+    const visor = mesh(geo.visor, this.trimMat, 0.11, 0.135, false);
     this.head.add(visor);
     this.torso.add(this.head);
 
@@ -143,7 +155,7 @@ export class CharacterModel {
     const foreR = buildArm(1, this.armR);
     buildArm(-1, this.armL);
     // Weapon carried in the right hand, pointing forward.
-    const gun = mesh(geo.gun, body, -0.3, 0.22);
+    const gun = mesh(geo.gun, body, -0.3, 0.22, false);
     gun.rotation.x = Math.PI / 2;
     foreR.add(gun);
 
@@ -152,22 +164,24 @@ export class CharacterModel {
       group.add(mesh(geo.thigh, body, -0.21));
       shin.position.set(0, -0.42, 0);
       shin.add(mesh(geo.shin, body, -0.21));
-      shin.add(mesh(geo.foot, body, -0.42, 0.06));
+      shin.add(mesh(geo.foot, body, -0.42, 0.06, false));
       group.add(shin);
       this.root.add(group);
     };
     buildLeg(1, this.legR, this.shinR);
     buildLeg(-1, this.legL, this.shinL);
 
+    this.labelText = name;
     this.label = makeLabel(name);
     this.label.position.set(0, 2.16, 0);
     this.root.add(this.label);
   }
 
   setName(name: string): void {
+    if (name === this.labelText) return;
+    this.labelText = name;
     const old = this.label.material.map;
-    const next = makeLabel(name);
-    this.label.material.map = next.material.map;
+    this.label.material.map = makeLabelTexture(name);
     this.label.material.needsUpdate = true;
     old?.dispose();
   }

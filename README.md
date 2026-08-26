@@ -6,6 +6,7 @@
 - **클라이언트**: TypeScript + three.js (WebGL2, PBR + 실시간 그림자 + 포스트프로세싱)
 - **서버**: Cloudflare Workers + Durable Objects (권위 서버, 64Hz 시뮬레이션)
 - **네트워크**: WebSocket 바이너리 프로토콜, 클라이언트 예측 + 서버 재조정 + 지연 보상
+- **봇**: 자동 생성 내비게이션 그래프로 길을 찾고 엄폐물을 쓰는 AI — 방이 절대 비지 않습니다
 
 ---
 
@@ -34,7 +35,10 @@
 ## 구조
 
 ```
-packages/shared/     클라이언트와 서버가 함께 쓰는 결정적 시뮬레이션
+packages/shared/     클라이언트, 서버, 봇이 함께 쓰는 결정적 시뮬레이션
+  room.ts              권위 매치 전체 (전송 계층 비의존) — DO와 브라우저가 같은 코드를 실행
+  bot.ts               봇 AI: 타깃 선정, 조준 지연/오차, 버스트 사격, 교전 중 스트레이핑
+  nav.ts               충돌 지오메트리에서 자동 생성하는 다층 내비게이션 그래프
   constants.ts         틱레이트, 이동 상수 — 양쪽이 반드시 같은 값을 써야 함
   movement.ts          Quake/Source 스타일 이동 (예측·재조정의 기준)
   collision.ts         브러시 AABB 스윕 + 레이캐스트 (XZ 그리드 broadphase)
@@ -44,11 +48,12 @@ packages/shared/     클라이언트와 서버가 함께 쓰는 결정적 시뮬
   protocol.ts          바이너리 인코딩/디코딩
 
 apps/server/         Cloudflare Worker
-  index.ts             방 생성 API, /ws 업그레이드, 정적 파일 서빙
-  GameRoom.ts          Durable Object = 방 하나. 틱 루프, 히트 판정, 지연 보상
+  index.ts             퀵매치/방 API, /ws 업그레이드, 정적 파일 서빙
+  GameRoom.ts          Durable Object 래퍼 — 틱 타이머와 WebSocket 브리지가 전부 (95줄)
 
 apps/client/         Vite + three.js
   net/Connection.ts    소켓, 스냅샷 버퍼, RTT 측정
+  net/LocalConnection.ts  같은 탭에서 MatchRoom을 호스팅하는 오프라인 모드
   game/Game.ts         메인 루프, 예측/재조정, 원격 플레이어 보간
   game/Renderer.ts     하늘·IBL·그림자·블룸·컬러그레이딩
   game/Materials.ts    절차적 PBR 텍스처 (에셋 파일 0개)
@@ -85,14 +90,36 @@ pnpm dev:client        # http://127.0.0.1:5173
 pnpm smoke     # 이동 / 사격 / 히트 판정 / 스냅샷 흐름을 실제 소켓으로 확인
 ```
 
-## 배포
-
-```bash
-pnpm deploy    # 클라이언트 빌드 후 wrangler deploy
-```
+## 배포 (지금 바로 멀티하려면)
 
 Worker 하나가 정적 파일과 게임 서버를 모두 담당합니다(`wrangler.jsonc` 의 `assets` 바인딩).
-`wrangler login` 이 한 번 필요하고, Durable Object 마이그레이션은 `v1` 태그로 정의돼 있습니다.
+배포하면 `https://webgame.<서브도메인>.workers.dev` 주소가 나오고, 그 주소가 곧 게임입니다.
+
+```bash
+pnpm install
+npx wrangler login        # 브라우저에서 한 번만 승인
+pnpm deploy               # 클라이언트 빌드 + Worker 배포
+```
+
+계정 없이 바로 띄워보고 싶으면 로그인을 건너뛸 수도 있습니다 (임시 프리뷰 계정, 일정 시간 후 만료):
+
+```bash
+pnpm --filter @webgame/client build
+cd apps/server && npx wrangler deploy --temporary
+```
+
+Durable Object 마이그레이션은 `v1` 태그로 정의돼 있고, SQLite 백엔드라 무료 플랜에서도 동작합니다.
+
+### 배포 후 같이 하는 법
+
+1. 나온 주소를 열고 **Quick match** 를 누릅니다.
+2. 상대도 같은 주소에서 **Quick match** 를 누르면 자동으로 같은 방(`ARENA`)에 들어옵니다.
+   코드를 주고받을 필요가 없습니다.
+3. 빈 자리는 봇이 채우고, 사람이 들어오면 봇이 빠집니다(총 6명 유지).
+4. 특정 방에 같이 들어가고 싶으면 주소창의 `#ARENA` 같은 링크를 그대로 공유하거나,
+   **Join match code** 로 5자리 코드를 입력하면 됩니다.
+5. 서버 없이 혼자 감을 잡고 싶으면 **Solo vs bots** — 브라우저 안에서 같은 서버 코드를
+   그대로 돌립니다.
 
 ---
 

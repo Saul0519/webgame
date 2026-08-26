@@ -112,9 +112,9 @@ const RECIPES: Partial<Record<Surface, SurfaceRecipe>> = {
       return [base, base * 1.02, base * 1.08, holes * 2 - 1];
     },
     metalness: 0.85,
-    roughBase: 0.45,
-    roughVar: 0.2,
-    normalScale: 1.8,
+    roughBase: 0.52,
+    roughVar: 0.16,
+    normalScale: 1.0,
   },
   [Surface.Emissive]: {
     shade: () => [0.75, 0.93, 1.0, 0],

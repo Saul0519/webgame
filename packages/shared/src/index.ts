@@ -6,3 +6,6 @@ export * from './movement.js';
 export * from './hitbox.js';
 export * from './protocol.js';
 export * from './weapons.js';
+export * from './nav.js';
+export * from './bot.js';
+export * from './room.js';

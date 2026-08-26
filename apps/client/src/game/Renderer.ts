@@ -23,7 +23,7 @@ const GradeShader = {
     uTime: { value: 0 },
     uVignette: { value: 0.9 },
     uGrain: { value: 0.022 },
-    uAberration: { value: 0.0016 },
+    uAberration: { value: 0.0007 },
     uDamage: { value: 0 },
   },
   vertexShader: /* glsl */ `

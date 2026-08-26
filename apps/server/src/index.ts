@@ -10,6 +10,13 @@ export interface Env {
 // No vowels / ambiguous glyphs: room codes get read out loud.
 const CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
+/**
+ * Public rooms for quick match. Everyone is funnelled into the first one with
+ * space so two people opening the site land in the same fight without swapping
+ * codes; later rooms only fill once the earlier ones are full.
+ */
+const PUBLIC_ROOMS = ['ARENA', 'BLAZE', 'CRUX2', 'DELTA', 'EDGE7', 'FRAG9', 'GAMMA', 'HYDRA'];
+
 function makeRoomCode(): string {
   const bytes = new Uint8Array(ROOM_CODE_LEN);
   crypto.getRandomValues(bytes);
@@ -74,6 +81,26 @@ export default {
       const res = await stub.fetch(new Request('https://room/info'));
       const info = (await res.json()) as Record<string, unknown>;
       return json({ code, ...info });
+    }
+
+    if (url.pathname === '/api/quickmatch') {
+      const infos = await Promise.all(
+        PUBLIC_ROOMS.map(async (code) => {
+          try {
+            const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(code));
+            const res = await stub.fetch(new Request('https://room/info'));
+            const info = (await res.json()) as { players?: number; maxPlayers?: number };
+            return { code, players: info.players ?? 0, maxPlayers: info.maxPlayers ?? MAX_PLAYERS_PER_ROOM };
+          } catch {
+            return { code, players: 0, maxPlayers: MAX_PLAYERS_PER_ROOM };
+          }
+        }),
+      );
+      const open = infos.filter((i) => i.players < i.maxPlayers);
+      // Prefer a room that already has people in it, fullest first.
+      const busiest = open.filter((i) => i.players > 0).sort((a, b) => b.players - a.players)[0];
+      const chosen = busiest ?? open[0] ?? { code: makeRoomCode(), players: 0 };
+      return json({ code: chosen.code, players: chosen.players, public: true });
     }
 
     if (url.pathname === '/api/health') {

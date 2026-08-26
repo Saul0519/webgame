@@ -1,7 +1,7 @@
 import './style.css';
 import { Game } from './game/Game.js';
 import { Hud } from './ui/Hud.js';
-import { Menu, type Settings } from './ui/Menu.js';
+import { Menu, type StartRequest } from './ui/Menu.js';
 
 const app = document.getElementById('app')!;
 
@@ -13,13 +13,13 @@ app.appendChild(loading);
 const hud = new Hud(app);
 let game: Game | null = null;
 
-const menu = new Menu(app, async (room: string, settings: Settings) => {
+const menu = new Menu(app, async ({ room, settings, offline, fillTo }: StartRequest) => {
   loading.classList.remove('hidden');
   // Let the browser paint the loading state before the (synchronous) texture
   // and geometry build blocks the main thread.
   await new Promise((r) => setTimeout(r, 30));
 
-  const g = new Game(app, hud, settings, (reason) => {
+  const g = new Game(app, hud, { ...settings, offline, fillTo }, (reason) => {
     g.dispose();
     game = null;
     hud.hide();

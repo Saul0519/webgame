@@ -22,7 +22,8 @@ import {
   type Vec3,
   type WireInput,
 } from '@webgame/shared';
-import { Connection, type GameEvent, type SnapPlayer, type Snapshot } from '../net/Connection.js';
+import { Connection, type GameConnection, type GameEvent, type SnapPlayer, type Snapshot } from '../net/Connection.js';
+import { LocalConnection } from '../net/LocalConnection.js';
 import { RenderSystem, type Quality } from './Renderer.js';
 import { buildSurfaceMaterials } from './Materials.js';
 import { buildLevel } from './LevelBuilder.js';
@@ -72,6 +73,11 @@ export interface GameOptions {
   sensitivity: number;
   quality: Quality;
   name: string;
+  /** Host the match in this tab instead of connecting to a server. */
+  offline?: boolean;
+  /** Total participants (including you) when bots fill the match. */
+  fillTo?: number;
+  botSkill?: number;
 }
 
 export class Game {
@@ -80,7 +86,8 @@ export class Game {
   private readonly effects: Effects;
   private readonly audio = new AudioEngine();
   private readonly hud: Hud;
-  private conn: Connection;
+  private conn: GameConnection;
+  readonly offline: boolean;
   private map: GameMap;
   private world: CollisionWorld;
 
@@ -118,6 +125,7 @@ export class Game {
   private matchRemaining = 0;
   private matchKillLimit = 30;
   private intermission = false;
+  private matchStateKnown = false;
 
   private predictionError = new THREE.Vector3();
   private hudDamage = 0;
@@ -130,6 +138,7 @@ export class Game {
   private onDisconnect: (reason: string) => void;
 
   private tmpVec = new THREE.Vector3();
+  private tmpMuzzle = new THREE.Vector3();
 
   constructor(container: HTMLElement, hud: Hud, opts: GameOptions, onDisconnect: (reason: string) => void) {
     this.hud = hud;
@@ -154,12 +163,17 @@ export class Game {
 
     this.effects = new Effects(this.render.scene);
 
-    this.conn = new Connection({
-      onWelcome: (w) => this.onWelcome(w.playerId, w.roster),
-      onSnapshot: (s) => this.onSnapshot(s),
-      onEvents: (e) => this.onEvents(e),
-      onClose: (reason) => this.onDisconnect(reason),
-    });
+    const handlers = {
+      onWelcome: (w: { playerId: number; roster: { id: number; name: string }[] }) =>
+        this.onWelcome(w.playerId, w.roster),
+      onSnapshot: (s: Snapshot) => this.onSnapshot(s),
+      onEvents: (e: GameEvent[]) => this.onEvents(e),
+      onClose: (reason: string) => this.onDisconnect(reason),
+    };
+    this.offline = opts.offline === true;
+    this.conn = this.offline
+      ? new LocalConnection(handlers, { fillTo: opts.fillTo ?? 6, botSkill: opts.botSkill ?? 0.55 })
+      : new Connection(handlers);
 
     this.bindInput();
     window.addEventListener('resize', this.handleResize);
@@ -455,7 +469,12 @@ export class Game {
           } else {
             this.hud.flashHit(ev.part === 1);
             this.audio.hitmarker(ev.part === 1);
-            this.effects.spawnBlood(ev.x, ev.y, ev.z, 0, 0, 0, ev.killed);
+            const cam = this.render.camera.position;
+            const bx = ev.x - cam.x;
+            const by = ev.y - cam.y;
+            const bz = ev.z - cam.z;
+            const bl = Math.hypot(bx, by, bz) || 1;
+            this.effects.spawnBlood(ev.x, ev.y, ev.z, bx / bl, by / bl, bz / bl, ev.killed);
           }
           break;
         }
@@ -514,12 +533,15 @@ export class Game {
             if (r) r.model.setName(row.name);
           }
           break;
-        case 'match':
+        case 'match': {
+          const changed = this.matchStateKnown && ev.intermission !== this.intermission;
           this.intermission = ev.intermission;
           this.matchRemaining = ev.remainingMs;
           this.matchKillLimit = ev.killLimit;
-          this.hud.showToast(ev.intermission ? 'Match over' : 'Round start');
+          if (changed) this.hud.showToast(ev.intermission ? 'Match over' : 'Round start');
+          this.matchStateKnown = true;
           break;
+        }
       }
     }
   }
@@ -529,8 +551,8 @@ export class Game {
     const hit = this.world.raycast(ev.x, ev.y, ev.z, ev.dx, ev.dy, ev.dz, 200);
     const dist = hit ? hit.t : 60;
     this.effects.spawnTracer(
-      new THREE.Vector3(ev.x, ev.y, ev.z),
-      new THREE.Vector3(ev.x + ev.dx * dist, ev.y + ev.dy * dist, ev.z + ev.dz * dist),
+      ev.x, ev.y, ev.z,
+      ev.x + ev.dx * dist, ev.y + ev.dy * dist, ev.z + ev.dz * dist,
     );
     const d = this.distanceToCamera(ev.x, ev.y, ev.z);
     this.audio.gunshot(ev.weapon as WeaponId, d, this.panFor(ev.x, ev.z));
@@ -668,15 +690,16 @@ export class Game {
     const base: Vec3 = { x: 0, y: 0, z: 0 };
     dirFromAngles(quantAngle(this.yaw), quantAngle(this.pitch), base);
 
-    const muzzle = this.vm.muzzleWorld;
+    const muzzle = this.tmpMuzzle.copy(this.vm.muzzleViewSpace);
+    this.render.camera.localToWorld(muzzle);
     for (let i = 0; i < w.pellets; i++) {
       const dir: Vec3 = { x: 0, y: 0, z: 0 };
       coneSpread(base, spread, rng, dir);
       const hit = this.world.raycast(eye.x, eye.y, eye.z, dir.x, dir.y, dir.z, 200);
       const dist = hit ? hit.t : 60;
       this.effects.spawnTracer(
-        muzzle.clone(),
-        new THREE.Vector3(eye.x + dir.x * dist, eye.y + dir.y * dist, eye.z + dir.z * dist),
+        muzzle.x, muzzle.y, muzzle.z,
+        eye.x + dir.x * dist, eye.y + dir.y * dist, eye.z + dir.z * dist,
       );
     }
     s.bloom = Math.min(w.bloomMax, s.bloom + w.bloomPerShot);
@@ -827,7 +850,7 @@ export class Game {
     this.hud.setMatch(this.matchRemaining, this.matchKillLimit, this.intermission, leader);
 
     this.hud.setNetStat([
-      `${Math.round(this.conn.rttMs)} ms rtt`,
+      this.offline ? 'offline match' : `${Math.round(this.conn.rttMs)} ms rtt`,
       `${TICK_MS.toFixed(1)} ms tick`,
       `${this.render.drawCalls} draws`,
       `${this.remotes.size + 1} players`,

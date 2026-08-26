@@ -169,6 +169,7 @@ export class ViewModel {
   private muzzleLight: THREE.PointLight;
   private muzzleSprite: THREE.Sprite;
   private flashT = 0;
+  private readonly muzzleScratch = new THREE.Vector3();
 
   constructor(fov: number) {
     this.camera = new THREE.PerspectiveCamera(fov, 1, 0.01, 12);
@@ -239,8 +240,14 @@ export class ViewModel {
     this.reloadT = 1;
   }
 
-  get muzzleWorld(): THREE.Vector3 {
-    return this.current.muzzle.getWorldPosition(new THREE.Vector3());
+  /**
+   * Muzzle position in *view space*. The viewmodel lives in its own scene whose
+   * camera sits at the origin, so this is the offset from the player's eye and
+   * must be pushed through the world camera before it means anything in the
+   * level. Returns a shared vector: copy it if you need to keep it.
+   */
+  get muzzleViewSpace(): THREE.Vector3 {
+    return this.current.muzzle.getWorldPosition(this.muzzleScratch);
   }
 
   update(dt: number, opts: { lookDx: number; lookDy: number; speed: number; grounded: boolean; ads: number; reloadProgress: number }): void {

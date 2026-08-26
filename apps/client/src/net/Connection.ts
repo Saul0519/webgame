@@ -58,14 +58,29 @@ export interface Welcome {
   roster: { id: number; name: string; kills: number; deaths: number }[];
 }
 
-type Handlers = {
+/** Everything the game needs from a link to a match, online or in-process. */
+export interface GameConnection {
+  readonly rttMs: number;
+  readonly open: boolean;
+  connect(room: string, name: string): Promise<void>;
+  close(): void;
+  sendInputs(inputs: WireInput[], rewindMs: number): void;
+  sendRespawn(): void;
+  sendChat(text: string): void;
+  sendWeapon(id: number): void;
+}
+
+export type ConnectionHandlers = {
+
   onWelcome: (w: Welcome) => void;
   onSnapshot: (s: Snapshot) => void;
   onEvents: (e: GameEvent[]) => void;
   onClose: (reason: string) => void;
 };
 
-export class Connection {
+type Handlers = ConnectionHandlers;
+
+export class Connection implements GameConnection {
   private ws: WebSocket | null = null;
   private handlers: Handlers;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
@@ -167,6 +182,11 @@ export class Connection {
     const w = new Writer(4);
     w.u8(C2S.SwitchWeapon).u8(id);
     this.ws!.send(w.finish());
+  }
+
+  /** Decode one server frame. Public so an in-process host can reuse the parser. */
+  ingest(buf: ArrayBuffer): void {
+    this.handleFrame(buf);
   }
 
   private handleFrame(buf: ArrayBuffer): void {

@@ -1,7 +1,8 @@
 import * as THREE from 'three';
 import { Surface } from '@webgame/shared';
 
-const MAX_PARTICLES = 900;
+const MAX_SPARKS = 600;
+const MAX_DEBRIS = 600;
 const MAX_TRACERS = 48;
 const MAX_DECALS = 160;
 
@@ -40,7 +41,7 @@ void main() {
 }
 `;
 
-interface Particle {
+interface ParticleState {
   life: number;
   maxLife: number;
   vx: number;
@@ -51,57 +52,132 @@ interface Particle {
   size: number;
 }
 
+/** A pooled point-sprite emitter. Sparks glow (additive); dust and blood do not. */
+class ParticleSystem {
+  readonly points: THREE.Points;
+  private readonly pos: Float32Array;
+  private readonly size: Float32Array;
+  private readonly alpha: Float32Array;
+  private readonly colour: Float32Array;
+  private readonly state: ParticleState[] = [];
+  private readonly capacity: number;
+  private next = 0;
+
+  constructor(capacity: number, blending: THREE.Blending) {
+    this.capacity = capacity;
+    const geo = new THREE.BufferGeometry();
+    this.pos = new Float32Array(capacity * 3);
+    this.size = new Float32Array(capacity);
+    this.alpha = new Float32Array(capacity);
+    this.colour = new Float32Array(capacity * 3);
+    geo.setAttribute('position', new THREE.BufferAttribute(this.pos, 3));
+    geo.setAttribute('aSize', new THREE.BufferAttribute(this.size, 1));
+    geo.setAttribute('aAlpha', new THREE.BufferAttribute(this.alpha, 1));
+    geo.setAttribute('aColour', new THREE.BufferAttribute(this.colour, 3));
+    geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 400);
+    this.points = new THREE.Points(
+      geo,
+      new THREE.ShaderMaterial({
+        vertexShader: PARTICLE_VERT,
+        fragmentShader: PARTICLE_FRAG,
+        transparent: true,
+        depthWrite: false,
+        blending,
+      }),
+    );
+    this.points.frustumCulled = false;
+    for (let i = 0; i < capacity; i++) {
+      this.state.push({ life: 0, maxLife: 1, vx: 0, vy: 0, vz: 0, drag: 2, gravity: 9, size: 1 });
+    }
+  }
+
+  emit(
+    x: number, y: number, z: number,
+    vx: number, vy: number, vz: number,
+    colour: THREE.Color, size: number, life: number, gravity: number, drag: number,
+  ): void {
+    const i = this.next;
+    this.next = (this.next + 1) % this.capacity;
+    this.pos[i * 3] = x;
+    this.pos[i * 3 + 1] = y;
+    this.pos[i * 3 + 2] = z;
+    this.colour[i * 3] = colour.r;
+    this.colour[i * 3 + 1] = colour.g;
+    this.colour[i * 3 + 2] = colour.b;
+    this.size[i] = size;
+    this.alpha[i] = 1;
+    const s = this.state[i];
+    s.life = life;
+    s.maxLife = life;
+    s.vx = vx;
+    s.vy = vy;
+    s.vz = vz;
+    s.size = size;
+    s.gravity = gravity;
+    s.drag = drag;
+  }
+
+  update(dt: number): void {
+    let dirty = false;
+    for (let i = 0; i < this.capacity; i++) {
+      const s = this.state[i];
+      if (s.life <= 0) {
+        if (this.alpha[i] !== 0) {
+          this.alpha[i] = 0;
+          dirty = true;
+        }
+        continue;
+      }
+      dirty = true;
+      s.life -= dt;
+      const k = Math.max(0, s.life / s.maxLife);
+      s.vy -= s.gravity * dt;
+      const drag = Math.max(0, 1 - s.drag * dt);
+      s.vx *= drag;
+      s.vy *= drag;
+      s.vz *= drag;
+      this.pos[i * 3] += s.vx * dt;
+      this.pos[i * 3 + 1] += s.vy * dt;
+      this.pos[i * 3 + 2] += s.vz * dt;
+      this.alpha[i] = k * k;
+      this.size[i] = s.size * (0.5 + k * 0.5);
+    }
+    if (!dirty) return;
+    const g = this.points.geometry;
+    (g.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
+    (g.getAttribute('aAlpha') as THREE.BufferAttribute).needsUpdate = true;
+    (g.getAttribute('aSize') as THREE.BufferAttribute).needsUpdate = true;
+    (g.getAttribute('aColour') as THREE.BufferAttribute).needsUpdate = true;
+  }
+}
+
 /** Impact sparks, bullet holes, tracers and blood — all pooled, no allocations
  * in the hot path. */
 export class Effects {
-  private readonly scene: THREE.Scene;
-
-  private readonly particles: THREE.Points;
-  private readonly pPos: Float32Array;
-  private readonly pSize: Float32Array;
-  private readonly pAlpha: Float32Array;
-  private readonly pColour: Float32Array;
-  private readonly pState: Particle[] = [];
-  private pNext = 0;
+  private readonly sparks = new ParticleSystem(MAX_SPARKS, THREE.AdditiveBlending);
+  private readonly debris = new ParticleSystem(MAX_DEBRIS, THREE.NormalBlending);
 
   private readonly tracerMesh: THREE.InstancedMesh;
   private readonly tracers: { life: number; maxLife: number; from: THREE.Vector3; to: THREE.Vector3 }[] = [];
   private tracerNext = 0;
-  private readonly dummy = new THREE.Object3D();
 
   private readonly decalMesh: THREE.InstancedMesh;
-  private readonly decalAge: number[] = [];
   private decalNext = 0;
 
+  // Scratch objects: the update loop runs every frame and must not allocate.
+  private readonly dummy = new THREE.Object3D();
+  private readonly vCam = new THREE.Vector3();
+  private readonly vDir = new THREE.Vector3();
+  private readonly vToCam = new THREE.Vector3();
+  private readonly vSide = new THREE.Vector3();
+  private readonly vFace = new THREE.Vector3();
+  private readonly mBasis = new THREE.Matrix4();
+  private readonly bloodColour = new THREE.Color(0.42, 0.03, 0.04);
+
   constructor(scene: THREE.Scene) {
-    this.scene = scene;
+    scene.add(this.debris.points);
+    scene.add(this.sparks.points);
 
-    // --- particles ---
-    const geo = new THREE.BufferGeometry();
-    this.pPos = new Float32Array(MAX_PARTICLES * 3);
-    this.pSize = new Float32Array(MAX_PARTICLES);
-    this.pAlpha = new Float32Array(MAX_PARTICLES);
-    this.pColour = new Float32Array(MAX_PARTICLES * 3);
-    geo.setAttribute('position', new THREE.BufferAttribute(this.pPos, 3));
-    geo.setAttribute('aSize', new THREE.BufferAttribute(this.pSize, 1));
-    geo.setAttribute('aAlpha', new THREE.BufferAttribute(this.pAlpha, 1));
-    geo.setAttribute('aColour', new THREE.BufferAttribute(this.pColour, 3));
-    geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 200);
-    const mat = new THREE.ShaderMaterial({
-      vertexShader: PARTICLE_VERT,
-      fragmentShader: PARTICLE_FRAG,
-      transparent: true,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-    });
-    this.particles = new THREE.Points(geo, mat);
-    this.particles.frustumCulled = false;
-    scene.add(this.particles);
-    for (let i = 0; i < MAX_PARTICLES; i++) {
-      this.pState.push({ life: 0, maxLife: 1, vx: 0, vy: 0, vz: 0, drag: 2, gravity: 9, size: 1 });
-    }
-
-    // --- tracers ---
     const tracerGeo = new THREE.PlaneGeometry(1, 1);
     tracerGeo.translate(0, 0.5, 0); // pivot at the base so scaling stretches forward
     const tracerMat = new THREE.MeshBasicMaterial({
@@ -115,17 +191,12 @@ export class Effects {
     this.tracerMesh = new THREE.InstancedMesh(tracerGeo, tracerMat, MAX_TRACERS);
     this.tracerMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.tracerMesh.frustumCulled = false;
-    this.tracerMesh.count = MAX_TRACERS;
     scene.add(this.tracerMesh);
     for (let i = 0; i < MAX_TRACERS; i++) {
       this.tracers.push({ life: 0, maxLife: 0.07, from: new THREE.Vector3(), to: new THREE.Vector3() });
-      this.dummy.position.set(0, -1000, 0);
-      this.dummy.scale.setScalar(0.0001);
-      this.dummy.updateMatrix();
-      this.tracerMesh.setMatrixAt(i, this.dummy.matrix);
+      this.park(this.tracerMesh, i);
     }
 
-    // --- bullet holes ---
     const decalGeo = new THREE.PlaneGeometry(1, 1);
     const decalMat = new THREE.MeshBasicMaterial({
       map: makeHoleTexture(),
@@ -140,47 +211,17 @@ export class Effects {
     this.decalMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.decalMesh.frustumCulled = false;
     scene.add(this.decalMesh);
-    for (let i = 0; i < MAX_DECALS; i++) {
-      this.decalAge.push(Infinity);
-      this.dummy.position.set(0, -1000, 0);
-      this.dummy.scale.setScalar(0.0001);
-      this.dummy.updateMatrix();
-      this.decalMesh.setMatrixAt(i, this.dummy.matrix);
-    }
+    for (let i = 0; i < MAX_DECALS; i++) this.park(this.decalMesh, i);
   }
 
-  private emit(
-    x: number,
-    y: number,
-    z: number,
-    vx: number,
-    vy: number,
-    vz: number,
-    colour: THREE.Color,
-    size: number,
-    life: number,
-    gravity: number,
-    drag: number,
-  ): void {
-    const i = this.pNext;
-    this.pNext = (this.pNext + 1) % MAX_PARTICLES;
-    this.pPos[i * 3] = x;
-    this.pPos[i * 3 + 1] = y;
-    this.pPos[i * 3 + 2] = z;
-    this.pColour[i * 3] = colour.r;
-    this.pColour[i * 3 + 1] = colour.g;
-    this.pColour[i * 3 + 2] = colour.b;
-    this.pSize[i] = size;
-    this.pAlpha[i] = 1;
-    const s = this.pState[i];
-    s.life = life;
-    s.maxLife = life;
-    s.vx = vx;
-    s.vy = vy;
-    s.vz = vz;
-    s.size = size;
-    s.gravity = gravity;
-    s.drag = drag;
+  private park(mesh: THREE.InstancedMesh, i: number): void {
+    const d = this.dummy;
+    d.position.set(0, -1000, 0);
+    d.rotation.set(0, 0, 0);
+    d.scale.setScalar(0.0001);
+    d.updateMatrix();
+    mesh.setMatrixAt(i, d.matrix);
+    mesh.instanceMatrix.needsUpdate = true;
   }
 
   spawnImpact(x: number, y: number, z: number, nx: number, ny: number, nz: number, surf: number): void {
@@ -191,36 +232,27 @@ export class Effects {
       const vx = nx * 2.6 + (Math.random() - 0.5) * spread * 5;
       const vy = ny * 2.6 + (Math.random() - 0.5) * spread * 5 + 1.2;
       const vz = nz * 2.6 + (Math.random() - 0.5) * spread * 5;
-      const isSpark = Math.random() < cfg.spark;
-      this.emit(
-        x + nx * 0.02,
-        y + ny * 0.02,
-        z + nz * 0.02,
-        vx,
-        vy,
-        vz,
-        isSpark ? cfg.colour : cfg.dust,
-        isSpark ? 0.055 : 0.11,
-        isSpark ? 0.22 + Math.random() * 0.2 : 0.45 + Math.random() * 0.35,
-        isSpark ? 16 : 2.4,
-        isSpark ? 1.5 : 4.5,
-      );
+      if (Math.random() < cfg.spark) {
+        this.sparks.emit(x + nx * 0.02, y + ny * 0.02, z + nz * 0.02, vx, vy, vz,
+          cfg.colour, 0.055, 0.22 + Math.random() * 0.2, 16, 1.5);
+      } else {
+        this.debris.emit(x + nx * 0.02, y + ny * 0.02, z + nz * 0.02, vx * 0.5, vy * 0.5, vz * 0.5,
+          cfg.dust, 0.13, 0.45 + Math.random() * 0.35, 2.4, 4.5);
+      }
     }
     this.addDecal(x, y, z, nx, ny, nz);
   }
 
+  /** `dx/dy/dz` points from the shooter toward the victim, so spray goes with the round. */
   spawnBlood(x: number, y: number, z: number, dx: number, dy: number, dz: number, heavy: boolean): void {
-    const colour = new THREE.Color(0.55, 0.05, 0.06);
-    const n = heavy ? 22 : 10;
+    const n = heavy ? 24 : 11;
     for (let i = 0; i < n; i++) {
-      this.emit(
-        x,
-        y,
-        z,
-        -dx * 2 + (Math.random() - 0.5) * 3.2,
-        -dy * 2 + (Math.random() - 0.5) * 3.2 + 1.4,
-        -dz * 2 + (Math.random() - 0.5) * 3.2,
-        colour,
+      this.debris.emit(
+        x, y, z,
+        dx * 2.4 + (Math.random() - 0.5) * 3.0,
+        dy * 2.4 + (Math.random() - 0.5) * 3.0 + 1.5,
+        dz * 2.4 + (Math.random() - 0.5) * 3.0,
+        this.bloodColour,
         0.07 + Math.random() * 0.06,
         0.4 + Math.random() * 0.3,
         11,
@@ -229,18 +261,17 @@ export class Effects {
     }
   }
 
-  spawnTracer(from: THREE.Vector3, to: THREE.Vector3): void {
+  spawnTracer(fromX: number, fromY: number, fromZ: number, toX: number, toY: number, toZ: number): void {
     const t = this.tracers[this.tracerNext];
     this.tracerNext = (this.tracerNext + 1) % MAX_TRACERS;
-    t.from.copy(from);
-    t.to.copy(to);
+    t.from.set(fromX, fromY, fromZ);
+    t.to.set(toX, toY, toZ);
     t.life = t.maxLife;
   }
 
   private addDecal(x: number, y: number, z: number, nx: number, ny: number, nz: number): void {
     const i = this.decalNext;
     this.decalNext = (this.decalNext + 1) % MAX_DECALS;
-    this.decalAge[i] = 0;
     const d = this.dummy;
     d.position.set(x + nx * 0.012, y + ny * 0.012, z + nz * 0.012);
     d.lookAt(d.position.x + nx, d.position.y + ny, d.position.z + nz);
@@ -252,71 +283,35 @@ export class Effects {
   }
 
   update(dt: number, camera: THREE.Camera): void {
-    // Particles
-    for (let i = 0; i < MAX_PARTICLES; i++) {
-      const s = this.pState[i];
-      if (s.life <= 0) {
-        if (this.pAlpha[i] !== 0) this.pAlpha[i] = 0;
-        continue;
-      }
-      s.life -= dt;
-      const k = Math.max(0, s.life / s.maxLife);
-      s.vy -= s.gravity * dt;
-      const drag = Math.max(0, 1 - s.drag * dt);
-      s.vx *= drag;
-      s.vy *= drag;
-      s.vz *= drag;
-      this.pPos[i * 3] += s.vx * dt;
-      this.pPos[i * 3 + 1] += s.vy * dt;
-      this.pPos[i * 3 + 2] += s.vz * dt;
-      this.pAlpha[i] = k * k;
-      this.pSize[i] = s.size * (0.5 + k * 0.5);
-    }
-    const g = this.particles.geometry;
-    (g.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
-    (g.getAttribute('aAlpha') as THREE.BufferAttribute).needsUpdate = true;
-    (g.getAttribute('aSize') as THREE.BufferAttribute).needsUpdate = true;
-    (g.getAttribute('aColour') as THREE.BufferAttribute).needsUpdate = true;
+    this.sparks.update(dt);
+    this.debris.update(dt);
 
-    // Tracers: a thin billboarded quad stretched from muzzle to impact.
-    const camPos = camera.getWorldPosition(new THREE.Vector3());
-    let anyTracer = false;
+    camera.getWorldPosition(this.vCam);
+    let dirty = false;
     for (let i = 0; i < MAX_TRACERS; i++) {
       const t = this.tracers[i];
-      const d = this.dummy;
-      if (t.life <= 0) {
-        d.position.set(0, -1000, 0);
-        d.scale.setScalar(0.0001);
-        d.rotation.set(0, 0, 0);
-        d.updateMatrix();
-        this.tracerMesh.setMatrixAt(i, d.matrix);
-        continue;
-      }
-      anyTracer = true;
+      if (t.life <= 0) continue;
+      dirty = true;
       t.life -= dt;
       const k = Math.max(0, t.life / t.maxLife);
-      const dir = new THREE.Vector3().subVectors(t.to, t.from);
-      const len = dir.length();
-      dir.normalize();
-      const toCam = new THREE.Vector3().subVectors(camPos, t.from).normalize();
-      const side = new THREE.Vector3().crossVectors(dir, toCam).normalize();
-      const face = new THREE.Vector3().crossVectors(side, dir).normalize();
-      const m = new THREE.Matrix4().makeBasis(side, dir, face);
+      const d = this.dummy;
+      this.vDir.subVectors(t.to, t.from);
+      const len = this.vDir.length() || 0.001;
+      this.vDir.multiplyScalar(1 / len);
+      this.vToCam.subVectors(this.vCam, t.from).normalize();
+      this.vSide.crossVectors(this.vDir, this.vToCam);
+      if (this.vSide.lengthSq() < 1e-8) this.vSide.set(1, 0, 0);
+      this.vSide.normalize();
+      this.vFace.crossVectors(this.vSide, this.vDir).normalize();
+      this.mBasis.makeBasis(this.vSide, this.vDir, this.vFace);
       d.position.copy(t.from);
-      d.quaternion.setFromRotationMatrix(m);
+      d.quaternion.setFromRotationMatrix(this.mBasis);
       d.scale.set(0.035 * k + 0.008, len, 1);
       d.updateMatrix();
       this.tracerMesh.setMatrixAt(i, d.matrix);
+      if (t.life <= 0) this.park(this.tracerMesh, i);
     }
-    if (anyTracer || this.tracerMesh.instanceMatrix.needsUpdate) {
-      this.tracerMesh.instanceMatrix.needsUpdate = true;
-    }
-
-    // Fade old decals out by shrinking them (cheap, avoids per-instance alpha).
-    for (let i = 0; i < MAX_DECALS; i++) {
-      if (this.decalAge[i] === Infinity) continue;
-      this.decalAge[i] += dt;
-    }
+    if (dirty) this.tracerMesh.instanceMatrix.needsUpdate = true;
   }
 }
 

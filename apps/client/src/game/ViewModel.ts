@@ -224,6 +224,11 @@ export class ViewModel {
   }
 
   /** 0 disables the motion entirely, for players who find it nauseating. */
+  /** Hide the whole rig, e.g. while a scope is covering the screen. */
+  setVisible(v: boolean): void {
+    this.scene.visible = v;
+  }
+
   setStyle(sway: number, bob: number): void {
     this.swayScale = Math.max(0, sway);
     this.bobScale = Math.max(0, bob);

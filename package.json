@@ -12,6 +12,8 @@
     "typecheck": "pnpm -r typecheck",
     "deploy": "pnpm build && pnpm --filter @webgame/server deploy",
     "smoke": "node tools/smoke-test.mjs",
+    "sim": "node tools/sim-test.mjs",
+    "test": "node tools/sim-test.mjs && node tools/smoke-test.mjs",
     "build:standalone": "pnpm --filter @webgame/client build:standalone && node tools/build-standalone.mjs"
   },
   "devDependencies": {

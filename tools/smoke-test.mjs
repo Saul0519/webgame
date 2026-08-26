@@ -1,4 +1,5 @@
 // End-to-end smoke test for the authoritative server.
+import { loadShared } from './load-shared.mjs';
 //
 //   1. terminal A:  pnpm dev:server
 //   2. terminal B:  node tools/smoke-test.mjs
@@ -167,21 +168,144 @@ const aimAt = (self, other, buttons, forward, offset = 0) => () => {
 };
 
 console.log('B at', b.last.x.toFixed(1), b.last.y.toFixed(1), b.last.z.toFixed(1));
+
+// The same collision world the server uses. Blind navigation could not reliably
+// find a shot in this arena — the centre is a solid platform and two players
+// walking at each other simply wedge against opposite sides of it — so check
+// line of sight properly and sidestep only until it opens.
+const shared = await loadShared();
+const losWorld = new shared.CollisionWorld(shared.getMap('reactor'));
+const hasLineOfSight = () => {
+  const ox = a.last.x;
+  const oy = a.last.y + 1.62;
+  const oz = a.last.z;
+  const dx = b.last.x - ox;
+  const dy = b.last.y + 1.1 - oy;
+  const dz = b.last.z - oz;
+  const len = Math.hypot(dx, dy, dz) || 1;
+  const hit = losWorld.raycast(ox, oy, oz, dx / len, dy / len, dz / len, len);
+  return hit === null || hit.t >= len - 0.5;
+};
+
+const dmgCount = () => b.events.filter((e) => e === 3).length;
+// Orbit rather than close: the arena centre is a solid platform, so walking
+// straight at each other just wedges both players against opposite sides of it
+// at a fixed range with no shot between them.
+// Both players walk to the same open point rather than chasing each other.
+// Chasing does not converge here: the arena centre is a solid platform, so two
+// clients running the same controller mirror each other and settle on opposite
+// sides of it, and a one-sided circle just walks into the outer wall. Meeting
+// at a fixed spot has no such fixed point — they both simply arrive.
+const RENDEZVOUS_POINTS = (() => {
+  const map = shared.getMap('reactor');
+  const world = new shared.CollisionWorld(map);
+  const clearAt = (x, z) => !world.boxOverlaps(x, 0.9, z, { x: 0.4, y: 0.9, z: 0.4 });
+  // Somewhere genuinely open, not a nook: a standing spot with 3 m of clearance
+  // all round, so both players can walk in from any direction.
+  const open = (x, z) => {
+    if (!clearAt(x, z)) return false;
+    for (let i = 0; i < 8; i++) {
+      const th = (i / 8) * Math.PI * 2;
+      if (!clearAt(x + Math.cos(th) * 3, z + Math.sin(th) * 3)) return false;
+    }
+    return true;
+  };
+  // Collect several, spread around the ring: if a client cannot find its way to
+  // the first, it gets to try somewhere else rather than pacing a wall.
+  const spots = [];
+  for (let i = 0; i < 32 && spots.length < 4; i++) {
+    const th = ((((i * 11) % 32) / 32) * Math.PI * 2); // stride, so they are not adjacent
+    for (let r = 22; r <= 30; r += 1.5) {
+      const x = Math.cos(th) * r;
+      const z = Math.sin(th) * r;
+      if (open(x, z)) {
+        spots.push({ x, z });
+        break;
+      }
+    }
+  }
+  return spots.length > 0 ? spots : [{ x: 0, z: 22 }];
+})();
+let rvIndex = 0;
+let RENDEZVOUS = RENDEZVOUS_POINTS[0];
+
+const walkTo = (client, ticks, offset) =>
+  drive(
+    client,
+    () => {
+      const me = client.last;
+      const dx = RENDEZVOUS.x - me.x;
+      const dz = RENDEZVOUS.z - me.z;
+      return { buttons: 0, forward: 1, yaw: Math.atan2(-dx, -dz) + offset, pitch: 0 };
+    },
+    ticks,
+  );
+const distTo = (client) => Math.hypot(client.last.x - RENDEZVOUS.x, client.last.z - RENDEZVOUS.z);
+
+let losRange = Math.hypot(a.last.x - b.last.x, a.last.z - b.last.z);
+let attempts = 0;
+let found = false;
 const bHealthBefore = b.last.health;
+let prevA = distTo(a);
+let prevB = distTo(b);
+let stuckA = 0;
+let stuckB = 0;
+let barren = 0;
+for (; attempts < 30 && !found; attempts++) {
+  // Sidestep when a leg makes no progress, alternating hands so a corner is
+  // escaped rather than pressed into.
+  const oA = stuckA === 0 ? 0 : stuckA === 1 ? 1.1 : -1.1;
+  const oB = stuckB === 0 ? 0 : stuckB === 1 ? 1.1 : -1.1;
+  let dA = distTo(a);
+  let dB = distTo(b);
+  // Wedged: sidestepping only presses harder into the corner, so reverse out of
+  // it every third barren leg and pick the walk up again from open ground.
+  const backOut = barren > 0 && barren % 3 === 0;
+  if (backOut) {
+    await Promise.all([
+      drive(a, { buttons: 0, forward: dA > 4 ? -1 : 0, yaw: a.last.yaw ?? 0 }, 36),
+      drive(b, { buttons: 0, forward: dB > 4 ? -1 : 0, yaw: b.last.yaw ?? 0 }, 36),
+    ]);
+  }
+  await Promise.all([walkTo(a, 80, oA), walkTo(b, 80, oB)]);
+  dA = distTo(a);
+  dB = distTo(b);
+  barren = dA < 4 && dB < 4 ? 0 : barren + 1;
+  // Neither of them can get here. Try somewhere else on the ring.
+  if (barren > 0 && barren % 10 === 0 && RENDEZVOUS_POINTS.length > 1) {
+    rvIndex = (rvIndex + 1) % RENDEZVOUS_POINTS.length;
+    RENDEZVOUS = RENDEZVOUS_POINTS[rvIndex];
+    prevA = distTo(a);
+    prevB = distTo(b);
+    stuckA = 0;
+    stuckB = 0;
+    continue;
+  }
+  // Cycle straight -> right -> left -> straight rather than counting up: a
+  // sidestep that keeps growing walks the client away from the target and it
+  // never comes back.
+  stuckA = dA < prevA - 0.8 || dA < 2.5 ? 0 : (stuckA + 1) % 3;
+  stuckB = dB < prevB - 0.8 || dB < 2.5 ? 0 : (stuckB + 1) % 3;
+  prevA = dA;
+  prevB = dB;
+  if (dA > 4 || dB > 4 || !hasLineOfSight()) continue;
 
-await Promise.all([
-  drive(a, aimAt(a, b, 0, 1, 0.85), 200),
-  drive(b, aimAt(b, a, 0, 1, -0.85), 200),
-]);
-console.log('after orbit: A', a.last.x.toFixed(1), a.last.z.toFixed(1), '| B', b.last.x.toFixed(1), b.last.z.toFixed(1));
+  await Promise.all([drive(a, aimAt(a, b, 0, 0), 16), drive(b, { buttons: 0, forward: 0, yaw: 0 }, 16)]);
+  const before = dmgCount();
+  await Promise.all([drive(a, aimAt(a, b, 4, 0), 20), drive(b, { buttons: 0, forward: 0, yaw: 0 }, 20)]);
+  found = dmgCount() > before;
+  losRange = Math.hypot(a.last.x - b.last.x, a.last.z - b.last.z);
+}
 
-await Promise.all([drive(a, aimAt(a, b, 4, 0), 128), drive(b, { buttons: 0, forward: 0, yaw: 0 }, 128)]);
-
-const bHealthAfter = b.last.health;
-const gap = Math.hypot(a.last.x - b.last.x, a.last.z - b.last.z);
-const damageEvents = b.events.filter((e) => e === 3).length;
-console.log('B health:', bHealthBefore, '->', bHealthAfter, '| range', gap.toFixed(1), 'm | damage events', damageEvents);
-const damaged = bHealthAfter < bHealthBefore || damageEvents > 0 || b.events.filter((e) => e === 4).length > 0;
+const damaged = found;
+console.log('rendezvous', RENDEZVOUS.x.toFixed(1), RENDEZVOUS.z.toFixed(1),
+  `(${rvIndex + 1}/${RENDEZVOUS_POINTS.length})`,
+  '| hits after', attempts, 'leg(s) | range', losRange.toFixed(1), 'm');
+if (!found) {
+  console.log('  no shot found — A', a.last.x.toFixed(1), a.last.z.toFixed(1),
+    '| B', b.last.x.toFixed(1), b.last.z.toFixed(1), '| clear:', hasLineOfSight());
+}
+console.log('B health:', bHealthBefore, '->', b.last.health);
 
 const ok =
   a.id !== b.id &&

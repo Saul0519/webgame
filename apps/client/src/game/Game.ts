@@ -9,14 +9,18 @@ import {
   TICK_MS,
   WEAPONS,
   WeaponId,
+  MAX_GROUND_SPEED,
+  WALK_SCALE,
   coneSpread,
   createMoveState,
   dirFromAngles,
   fireIntervalMs,
+  fireSpread,
   getMap,
   mulberry32,
   quantAngle,
   simulateMovement,
+  sprayShot,
   type GameMap,
   type MoveState,
   type Vec3,
@@ -35,6 +39,9 @@ import type { Hud, ScoreRow } from '../ui/Hud.js';
 import { Minimap } from '../ui/Minimap.js';
 import { saveSettings, tierName, type GameSettings } from '../ui/SettingsPanel.js';
 import { PauseOverlay } from '../ui/PauseOverlay.js';
+import { t } from '../ui/i18n.js';
+import type { CrosshairConfig } from '../ui/Crosshair.js';
+import { BIND_ORDER, DEFAULT_BINDS, type KeyBinds } from '../ui/Keybinds.js';
 
 const DEFAULT_FOV = 92;
 /** Radians of view rotation per pixel of raw mouse movement, at sensitivity 1. */
@@ -76,9 +83,22 @@ interface LocalWeapon {
   ammo: number;
   nextFireAt: number;
   reloadDoneAt: number;
-  bloom: number;
+  /** Index within the current spray; picks the entry out of the recoil pattern. */
+  sprayIndex: number;
+  /** When the trigger last went off, so a pause can reset the pattern. */
+  lastFireAt: number;
   shots: number;
 }
+
+/**
+ * Mouse button masks, as `1 << MouseEvent.button`.
+ *
+ * MouseEvent.button numbers the middle button 1 and the right button 2, so the
+ * bit for "aim" is 1 << 2 = 4. A literal 2 there is the middle button, which is
+ * why right-click never brought the sights up.
+ */
+const MB_FIRE = 1 << 0;
+const MB_ADS = 1 << 2;
 
 /** Everything a match needs: the player's settings plus how to host it. */
 export type GameOptions = GameSettings & {
@@ -113,7 +133,15 @@ export class Game {
   private respawnAt = 0;
   private lastKiller = '';
 
-  private weapon: LocalWeapon = { id: WeaponId.Rifle, ammo: 30, nextFireAt: 0, reloadDoneAt: 0, bloom: 0, shots: 0 };
+  private weapon: LocalWeapon = {
+    id: WeaponId.Rifle,
+    ammo: WEAPONS[WeaponId.Rifle].magSize,
+    nextFireAt: 0,
+    reloadDoneAt: 0,
+    sprayIndex: 0,
+    lastFireAt: -1e9,
+    shots: 0,
+  };
   private serverMag = 30;
 
   private inputSeq = 1;
@@ -144,6 +172,14 @@ export class Game {
   private hovering = false;
   private chatOpen = false;
   private scoreboardOpen = false;
+  private binds: KeyBinds;
+  /** Reverse lookup so a keydown can be matched to an action in one step. */
+  private bindLookup = new Map<string, (keyof KeyBinds)[]>();
+  private wantFullscreen = true;
+  /** 0..1 aim-down-sights blend, paced by the weapon's own ADS time. */
+  private adsBlend = 0;
+  /** 0..1 crosshair firing error, bumped per shot and decayed. */
+  private fireError = 0;
 
   private remotes = new Map<number, RemotePlayer>();
   private scoreRows: ScoreRow[] = [];
@@ -172,6 +208,9 @@ export class Game {
     this.pitchSign = opts.invertY ? 1 : -1;
     this.mouseSmoothing = opts.mouseSmoothing ?? 0;
     this.baseFov = opts.fov ?? DEFAULT_FOV;
+    this.binds = { ...DEFAULT_BINDS, ...(opts.binds ?? {}) };
+    this.wantFullscreen = opts.fullscreen !== false;
+    this.rebuildBindLookup();
     this.onDisconnect = onDisconnect;
 
     this.map = getMap('reactor');
@@ -248,9 +287,9 @@ export class Game {
     renderScale: number;
     dynamicResolution: boolean;
     screenEffects: boolean;
-    crosshairColour: string;
-    crosshairDot: boolean;
-    crosshairDynamic: boolean;
+    crosshair: CrosshairConfig;
+    binds: KeyBinds;
+    fullscreen: boolean;
     minimapMode: number;
     showFps: boolean;
   }): void {
@@ -266,14 +305,56 @@ export class Game {
     this.render.setRenderScale(s.renderScale);
     this.render.setDynamicResolution(s.dynamicResolution);
     this.render.setScreenEffects(s.screenEffects);
-    this.hud.setCrosshairStyle(s.crosshairColour, s.crosshairDot, s.crosshairDynamic);
+    this.hud.setCrosshair(s.crosshair);
     this.hud.setNetStatVisible(s.showFps);
     this.minimap.setMode(s.minimapMode);
+    this.binds = { ...DEFAULT_BINDS, ...s.binds };
+    this.rebuildBindLookup();
+    this.hud.setRespawnKey(this.binds.jump);
+    this.wantFullscreen = s.fullscreen;
+    // Turning the option off mid-match should hand the shortcuts straight back.
+    if (!s.fullscreen && document.fullscreenElement) void this.exitFullscreen();
+  }
+
+  private rebuildBindLookup(): void {
+    this.bindLookup.clear();
+    for (const action of BIND_ORDER) {
+      const code = this.binds[action];
+      if (!code) continue;
+      const list = this.bindLookup.get(code);
+      if (list) list.push(action);
+      else this.bindLookup.set(code, [action]);
+    }
+  }
+
+  private held(action: keyof KeyBinds): boolean {
+    const code = this.binds[action];
+    return code !== '' && this.keys.has(code);
   }
 
   /** Exposed for the browser console and automated smoke tests. */
-  get debug(): { render: RenderSystem; vm: ViewModel; local: MoveState } {
-    return { render: this.render, vm: this.vm, local: this.local };
+  get debug(): {
+    render: RenderSystem;
+    vm: ViewModel;
+    local: MoveState;
+    world: CollisionWorld;
+    weapon: LocalWeapon;
+    state: { dead: boolean; health: number; mouseButtons: number; adsBlend: number; clock: number };
+  } {
+    return {
+      render: this.render,
+      vm: this.vm,
+      local: this.local,
+      world: this.world,
+      weapon: this.weapon,
+      state: {
+        dead: this.dead,
+        health: this.health,
+        mouseButtons: this.mouseButtons,
+        adsBlend: this.adsBlend,
+        clock: this.clock,
+      },
+    };
   }
 
   async connect(room: string, name: string, bots?: number, tier?: string): Promise<void> {
@@ -302,6 +383,7 @@ export class Game {
     window.removeEventListener('mouseup', this.handleMouseUp);
     window.removeEventListener('wheel', this.handleWheel);
     window.removeEventListener('contextmenu', preventDefault);
+    void this.exitFullscreen();
     this.conn.close();
     this.pause.dispose();
     this.render.renderer.dispose();
@@ -315,6 +397,9 @@ export class Game {
     canvas.addEventListener('click', () => {
       if (this.chatOpen || this.pause.isOpen) return;
       this.audio.ensure();
+      // Fullscreen needs a user gesture, and this click is one. Ask for it here
+      // rather than at match start so the request is never rejected.
+      if (this.wantFullscreen) void this.enterFullscreen();
       if (this.lockUnavailable) {
         this.fallbackAiming = true;
         return;
@@ -383,7 +468,58 @@ export class Game {
     this.fallbackAiming = true;
     this.pause.hide();
     this.hud.setPointerHint(false);
-    this.hud.showToast('Mouse lock blocked — open in a tab for full aim');
+    this.hud.showToast(t('toast.lockBlocked'));
+  }
+
+  /**
+   * Fullscreen plus the Keyboard Lock API.
+   *
+   * Outside fullscreen a page cannot cancel the browser's own chords: Ctrl+W
+   * closes the tab, Ctrl+D bookmarks, Ctrl+S saves. That is what makes a
+   * crouch-and-move (Ctrl+W) or a crouch-and-strafe (Ctrl+A/D) close the window
+   * mid-fight. Fullscreen is the one context where the browser will hand those
+   * keys to the page instead, so we take it whenever the player allows it.
+   */
+  private async enterFullscreen(): Promise<void> {
+    try {
+      if (!document.fullscreenElement) {
+        await document.documentElement.requestFullscreen({ navigationUI: 'hide' });
+      }
+    } catch {
+      return; // refused (iframe without the permission, or the user said no)
+    }
+    const kb = (navigator as Navigator & { keyboard?: { lock?: (codes?: string[]) => Promise<void> } }).keyboard;
+    if (!kb?.lock) return;
+    try {
+      await kb.lock();
+    } catch {
+      /* not granted; the C-for-crouch default still keeps the tab alive */
+    }
+  }
+
+  private async exitFullscreen(): Promise<void> {
+    const kb = (navigator as Navigator & { keyboard?: { unlock?: () => void } }).keyboard;
+    try {
+      kb?.unlock?.();
+    } catch {
+      /* nothing held */
+    }
+    if (!document.fullscreenElement) return;
+    try {
+      await document.exitFullscreen();
+    } catch {
+      /* already leaving */
+    }
+  }
+
+  private toggleFullscreen(): void {
+    if (document.fullscreenElement) {
+      void this.exitFullscreen();
+      this.hud.showToast(t('toast.fullscreenOff'));
+    } else {
+      void this.enterFullscreen();
+      this.hud.showToast(t('toast.fullscreenOn'));
+    }
   }
 
   /** True when the game should be reading mouse and keyboard input. */
@@ -402,6 +538,10 @@ export class Game {
       this.skipNextMove = true;
       this.pendingDx = 0;
       this.pendingDy = 0;
+      // A button left focused by the menu or the pause card still answers Space
+      // and Enter with a click, so a jump would re-trigger whatever it does.
+      const active = document.activeElement as HTMLElement | null;
+      if (active && active !== document.body) active.blur();
     }
     this.hud.setPointerHint(!this.locked && !this.chatOpen && !this.pause.isOpen);
   };
@@ -473,6 +613,10 @@ export class Game {
 
   private handleMouseDown = (e: MouseEvent): void => {
     if (!this.inputActive) return;
+    // Middle-click starts autoscroll and any drag starts a text selection;
+    // both survive pointer lock being released and leave the page in a state
+    // the next click has to clear before it reaches the game.
+    e.preventDefault();
     this.mouseButtons |= 1 << e.button;
   };
 
@@ -488,19 +632,15 @@ export class Game {
     this.switchWeapon(next);
   };
 
+  /** The first action bound to a key code, or null if the game ignores it. */
+  private actionFor(code: string): keyof KeyBinds | null {
+    const list = this.bindLookup.get(code);
+    return list && list.length > 0 ? list[0] : null;
+  }
+
   private handleKeyDown = (e: KeyboardEvent): void => {
     if (this.chatOpen) return;
-    if (e.code === 'KeyY') {
-      e.preventDefault();
-      this.openChat();
-      return;
-    }
-    if (e.code === 'Tab') {
-      e.preventDefault();
-      this.scoreboardOpen = true;
-      this.hud.toggleScoreboard(true);
-      return;
-    }
+
     if (e.code === 'Escape' && this.lockUnavailable) {
       e.preventDefault();
       if (this.pause.isOpen) {
@@ -512,36 +652,66 @@ export class Game {
       }
       return;
     }
-    if (e.code === 'KeyM') {
-      this.settings.minimapMode = this.minimap.cycle();
-      saveSettings(this.settings);
-      return;
+
+    const action = this.actionFor(e.code);
+    if (action === null) return;
+
+    // Every key the game claims is consumed here. Without this Space scrolls
+    // the page and clicks whatever button still holds focus, Tab walks the
+    // focus ring out of the canvas, and the digits and modifier chords reach
+    // the browser's own shortcut table. Under Keyboard Lock this is also what
+    // stops Ctrl+W from closing the tab.
+    if (this.inputActive || action === 'fullscreen') e.preventDefault();
+    // Auto-repeat must not re-fire one-shot actions; held movement keys are
+    // tracked by presence in the set, so a repeat there is harmless either way.
+    if (e.repeat) return;
+
+    switch (action) {
+      case 'chat':
+        this.openChat();
+        return;
+      case 'scoreboard':
+        this.scoreboardOpen = true;
+        this.hud.toggleScoreboard(true);
+        return;
+      case 'map':
+        this.settings.minimapMode = this.minimap.cycle();
+        saveSettings(this.settings);
+        return;
+      case 'mute':
+        this.settings.muted = !this.audio.isMuted;
+        this.audio.setMuted(this.settings.muted);
+        saveSettings(this.settings);
+        this.hud.showToast(this.settings.muted ? t('toast.muted') : t('toast.unmuted'));
+        return;
+      case 'fullscreen':
+        this.toggleFullscreen();
+        return;
+      case 'weapon1':
+        this.switchWeapon(WeaponId.Rifle);
+        return;
+      case 'weapon2':
+        this.switchWeapon(WeaponId.SMG);
+        return;
+      case 'weapon3':
+        this.switchWeapon(WeaponId.Shotgun);
+        return;
+      case 'weapon4':
+        this.switchWeapon(WeaponId.Sniper);
+        return;
+      default:
+        break;
     }
-    if (e.code === 'KeyO') {
-      this.settings.muted = !this.audio.isMuted;
-      this.audio.setMuted(this.settings.muted);
-      saveSettings(this.settings);
-      this.hud.showToast(this.settings.muted ? 'Audio muted' : 'Audio on');
-      return;
-    }
-    const weaponKeys: Record<string, WeaponId> = {
-      Digit1: WeaponId.Rifle,
-      Digit2: WeaponId.SMG,
-      Digit3: WeaponId.Shotgun,
-      Digit4: WeaponId.Sniper,
-    };
-    if (weaponKeys[e.code] !== undefined) {
-      this.switchWeapon(weaponKeys[e.code]);
-      return;
-    }
-    if (e.code === 'Space' && this.dead && performance.now() >= this.respawnAt) {
+
+    if (action === 'jump' && this.dead && performance.now() >= this.respawnAt) {
       this.conn.sendRespawn();
     }
     this.keys.add(e.code);
   };
 
   private handleKeyUp = (e: KeyboardEvent): void => {
-    if (e.code === 'Tab') {
+    const action = this.actionFor(e.code);
+    if (action === 'scoreboard') {
       this.scoreboardOpen = false;
       this.hud.toggleScoreboard(false);
     }
@@ -567,7 +737,15 @@ export class Game {
 
   private switchWeapon(id: WeaponId): void {
     if (id === this.weapon.id) return;
-    this.weapon = { id, ammo: WEAPONS[id].magSize, nextFireAt: this.clock + 350, reloadDoneAt: 0, bloom: 0, shots: 0 };
+    this.weapon = {
+      id,
+      ammo: WEAPONS[id].magSize,
+      nextFireAt: this.clock + 350,
+      reloadDoneAt: 0,
+      sprayIndex: 0,
+      lastFireAt: -1e9,
+      shots: 0,
+    };
     this.vm.setWeapon(id);
     this.conn.sendWeapon(id);
   }
@@ -717,7 +895,7 @@ export class Game {
           this.hud.addKillfeed(killer, victim, ev.weapon as WeaponId, ev.suicide, involvesSelf);
           if (ev.killer === this.selfId && !ev.suicide) {
             this.audio.kill();
-            this.hud.showToast('Eliminated');
+            this.hud.showToast(t('toast.eliminated'));
           }
           if (ev.victim === this.selfId) {
             this.lastKiller = ev.suicide ? '' : killer;
@@ -742,7 +920,10 @@ export class Game {
             this.health = MAX_HEALTH;
             this.weapon.ammo = WEAPONS[this.weapon.id].magSize;
             this.weapon.reloadDoneAt = 0;
-            this.weapon.bloom = 0;
+            this.weapon.sprayIndex = 0;
+            this.weapon.lastFireAt = -1e9;
+            this.adsBlend = 0;
+            this.fireError = 0;
             this.audio.spawn();
           } else {
             const r = this.ensureRemote(ev.id);
@@ -773,7 +954,7 @@ export class Game {
           this.intermission = ev.intermission;
           this.matchRemaining = ev.remainingMs;
           this.matchKillLimit = ev.killLimit;
-          if (changed) this.hud.showToast(ev.intermission ? 'Match over' : 'Round start');
+          if (changed) this.hud.showToast(t(ev.intermission ? 'toast.matchOver' : 'toast.roundStart'));
           this.matchStateKnown = true;
           break;
         }
@@ -802,7 +983,12 @@ export class Game {
     let dt = (now - this.lastFrame) / 1000;
     this.lastFrame = now;
     if (dt > 0.1) dt = 0.1;
-    this.clock += dt * 1000;
+    // Wall clock, not an accumulator. The fixed-step loop below caps how many
+    // ticks one frame may run, so on a slow machine an accumulated clock drifts
+    // behind real time and the client predicts a slower rate of fire than the
+    // server is actually giving it — tracers and shot sounds go missing exactly
+    // where the frame rate is already worst.
+    this.clock = now;
 
     this.accumulator += dt;
     let steps = 0;
@@ -844,24 +1030,41 @@ export class Game {
       this.applyLook(dx, dy);
     }
     const buttons = this.gatherButtons();
-    const forward = (this.keys.has('KeyW') ? 1 : 0) - (this.keys.has('KeyS') ? 1 : 0);
-    const rightRaw = (this.keys.has('KeyD') ? 1 : 0) - (this.keys.has('KeyA') ? 1 : 0);
-    const walk = this.keys.has('ShiftLeft') || this.keys.has('ShiftRight') ? 0.45 : 1;
+    let forward = (this.held('forward') ? 1 : 0) - (this.held('back') ? 1 : 0);
+    let rightRaw = (this.held('right') ? 1 : 0) - (this.held('left') ? 1 : 0);
+    // Normalise before scaling. The shared sim only normalises when the vector
+    // is longer than 1, so a pre-scaled diagonal (0.45, 0.45) slips through at
+    // length 0.64 and walks 41% faster diagonally than straight — which now
+    // also reads as "walking is accurate, except diagonally".
+    const axisLen = Math.hypot(forward, rightRaw);
+    if (axisLen > 1) {
+      forward /= axisLen;
+      rightRaw /= axisLen;
+    }
+    const walk = this.held('walk') ? WALK_SCALE : 1;
 
-    // Recoil recovery pulls the view back toward where the player was aiming.
+    // Recoil recovery pulls the view back toward where the player was aiming —
+    // but only once the trigger is off. Gate it on the trigger rather than on a
+    // timer: a rifle fires every 103 ms, so any fixed window short enough to
+    // feel responsive also expires between every pair of shots and cancels the
+    // climb the pattern is supposed to produce.
     const w = WEAPONS[this.weapon.id];
-    const rec = Math.min(1, w.recoilRecovery * TICK_DT);
-    this.pitch -= this.recoilPitch * rec;
-    this.yaw -= this.recoilYaw * rec;
-    this.recoilPitch *= 1 - rec;
-    this.recoilYaw *= 1 - rec;
-    this.pitch = Math.max(-1.5533, Math.min(1.5533, this.pitch));
+    if ((buttons & Btn.Fire) === 0) {
+      const rec = Math.min(1, w.recoilRecovery * TICK_DT);
+      this.pitch -= this.recoilPitch * rec;
+      this.yaw -= this.recoilYaw * rec;
+      this.recoilPitch *= 1 - rec;
+      this.recoilYaw *= 1 - rec;
+      this.pitch = Math.max(-1.5533, Math.min(1.5533, this.pitch));
+    }
 
     const input: WireInput = {
       seq: this.inputSeq++,
       buttons,
-      forward: this.dead ? 0 : forward * walk,
-      right: this.dead ? 0 : rightRaw * walk,
+      // Quantise exactly as the wire will, so prediction simulates the same
+      // numbers the server decodes instead of drifting by a rounding step.
+      forward: this.dead ? 0 : quantAxis(forward * walk),
+      right: this.dead ? 0 : quantAxis(rightRaw * walk),
       yaw: quantAngle(this.yaw),
       pitch: quantAngle(this.pitch),
     };
@@ -888,12 +1091,12 @@ export class Game {
 
   private gatherButtons(): number {
     let b = 0;
-    if (this.keys.has('Space')) b |= Btn.Jump;
-    if (this.keys.has('ControlLeft') || this.keys.has('ControlRight') || this.keys.has('KeyC')) b |= Btn.Crouch;
-    if ((this.mouseButtons & 1) !== 0) b |= Btn.Fire;
-    if ((this.mouseButtons & 2) !== 0) b |= Btn.Ads;
-    if (this.keys.has('ShiftLeft') || this.keys.has('ShiftRight')) b |= Btn.Sprint;
-    if (this.keys.has('KeyR')) b |= Btn.Reload;
+    if (this.held('jump')) b |= Btn.Jump;
+    if (this.held('crouch')) b |= Btn.Crouch;
+    if ((this.mouseButtons & MB_FIRE) !== 0) b |= Btn.Fire;
+    if ((this.mouseButtons & MB_ADS) !== 0) b |= Btn.Ads;
+    if (this.held('walk')) b |= Btn.Sprint;
+    if (this.held('reload')) b |= Btn.Reload;
     return b;
   }
 
@@ -907,15 +1110,18 @@ export class Game {
       s.ammo = w.magSize;
       this.audio.reload('in');
     }
-    s.bloom = Math.max(0, s.bloom - w.bloomDecay * TICK_DT);
-
     if ((buttons & Btn.Reload) !== 0 && s.reloadDoneAt === 0 && s.ammo < w.magSize) {
       s.reloadDoneAt = this.clock + w.reloadMs;
       this.vm.onReload();
       this.audio.reload('out');
     }
 
-    if ((buttons & Btn.Fire) === 0) return;
+    if ((buttons & Btn.Fire) === 0) {
+      // Same rule as the server: trigger release, not a timer, is what resets
+      // the pattern, so both sides index the same entry for the same shot.
+      s.sprayIndex = 0;
+      return;
+    }
     if (s.reloadDoneAt > 0 || this.clock < s.nextFireAt) return;
     if (s.ammo <= 0) {
       s.reloadDoneAt = this.clock + w.reloadMs;
@@ -924,12 +1130,24 @@ export class Game {
       return;
     }
 
+    // Let go of the trigger for long enough and the pattern starts over. This
+    // has to match the server's rule exactly or the predicted tracers drift
+    // away from where the shots actually went.
+    if (this.clock - s.lastFireAt > w.sprayResetMs) s.sprayIndex = 0;
+    s.lastFireAt = this.clock;
+
     s.ammo--;
     s.nextFireAt = this.clock + fireIntervalMs(w);
     s.shots = (s.shots + 1) & 0xffff;
 
     const ads = (buttons & Btn.Ads) !== 0;
-    const spread = (ads ? w.spreadAds : w.spreadHip) + s.bloom;
+    const spread = fireSpread(w, {
+      speed: Math.hypot(this.local.vx, this.local.vz),
+      grounded: this.local.grounded,
+      crouching: this.local.crouching,
+      ads,
+      sprayIndex: s.sprayIndex,
+    });
     // Same seed the server uses, so the predicted pellet pattern matches.
     const rng = mulberry32((this.selfId << 20) ^ (s.shots * 0x9e3779b1));
 
@@ -949,22 +1167,23 @@ export class Game {
         eye.x + dir.x * dist, eye.y + dir.y * dist, eye.z + dir.z * dist,
       );
     }
-    s.bloom = Math.min(w.bloomMax, s.bloom + w.bloomPerShot);
-
-    // View kick. Sign alternates so sustained fire drifts rather than climbing
-    // in a straight line.
-    const kickScale = ads ? 0.72 : 1;
+    // Fixed recoil pattern: the same shot index always kicks the same way, so
+    // the spray can be learned and countered rather than fought.
+    const kick = sprayShot(w, s.sprayIndex);
+    const kickScale = ads ? w.adsRecoilScale : 1;
     const before = this.pitch;
     // Symmetric so a future weapon with downward kick cannot escape the clamp.
-    this.pitch = Math.max(-1.5533, Math.min(1.5533, this.pitch + w.recoilUp * kickScale));
+    this.pitch = Math.max(-1.5533, Math.min(1.5533, this.pitch + kick.up * kickScale));
     // Mirror the clamp into the debt so recovery cannot pay back a kick that was
     // never applied — that shows up as the view sinking while firing upward.
     this.recoilPitch += this.pitch - before;
-    const side = (rng() - 0.5) * 2 * w.recoilSide * kickScale;
+    const side = kick.side * kickScale;
     this.recoilYaw += side;
     this.yaw += side;
 
-    this.vm.onFire(w.recoilUp * 60);
+    s.sprayIndex++;
+    this.fireError = Math.min(1, this.fireError + 0.42);
+    this.vm.onFire(kick.up * 55);
     this.audio.gunshot(this.weapon.id, 0, 0);
   }
 
@@ -1040,17 +1259,30 @@ export class Game {
     cam.rotateY(this.yaw);
     cam.rotateX(this.pitch);
 
-    const ads = (this.mouseButtons & 2) !== 0 && !this.dead ? 1 : 0;
+    // Each weapon states how long it takes to come up, so a scoped rifle is a
+    // real commitment and an SMG barely is.
+    const want = (this.mouseButtons & MB_ADS) !== 0 && !this.dead ? 1 : 0;
     const w = WEAPONS[this.weapon.id];
-    const targetFov = ads ? w.adsFov : this.baseFov;
-    const fov = cam.fov + (targetFov - cam.fov) * Math.min(1, 10 * dt);
+    const rate = 1000 / Math.max(60, w.adsTimeMs);
+    this.adsBlend += (want - this.adsBlend) * Math.min(1, rate * dt);
+    if (this.adsBlend < 1e-3) this.adsBlend = 0;
+    const ease = this.adsBlend * this.adsBlend * (3 - 2 * this.adsBlend);
+    const fov = this.baseFov + (w.adsFov - this.baseFov) * ease;
     this.render.setFov(fov);
     this.vm.resize(window.innerWidth / window.innerHeight, Math.max(32, fov * VM_FOV_RATIO));
+
+    // The scope only irises in over the back half of the animation, so the
+    // rifle is visibly coming up before the glass takes the screen.
+    const scope = w.scoped ? Math.max(0, Math.min(1, (ease - 0.45) / 0.55)) : 0;
+    this.hud.drawScope(scope, this.lookDx * -260, this.lookDy * -180);
+    // Nothing behind the glass is worth the fill rate, and a rifle body poking
+    // through the scope surround is the classic giveaway.
+    this.vm.setVisible(scope < 0.92);
   }
 
   private updateViewModel(dt: number): void {
     const speed = Math.hypot(this.local.vx, this.local.vz);
-    const ads = (this.mouseButtons & 2) !== 0 && !this.dead ? 1 : 0;
+    const ads = this.adsBlend;
     const reloadProgress =
       this.weapon.reloadDoneAt > 0
         ? 1 - (this.weapon.reloadDoneAt - this.clock) / WEAPONS[this.weapon.id].reloadMs
@@ -1083,11 +1315,18 @@ export class Game {
     this.hud.setHealth(this.health);
     this.hud.setAmmo(this.weapon.ammo, this.serverMag, this.weapon.id, this.weapon.reloadDoneAt > 0);
 
-    const ads = (this.mouseButtons & 2) !== 0 && !this.dead ? 1 : 0;
-    const w = WEAPONS[this.weapon.id];
-    const spreadRad = (ads ? w.spreadAds : w.spreadHip) + this.weapon.bloom;
-    const spreadPx = Math.tan(spreadRad) * (window.innerHeight / (2 * Math.tan((this.render.camera.fov * Math.PI) / 360)));
-    this.hud.drawCrosshair(Math.min(34, spreadPx), ads, this.hud.hitFade);
+    // The crosshair reports the two penalties the player can actually act on:
+    // how fast they are moving, and how deep into a spray they are.
+    this.fireError = Math.max(0, this.fireError - dt * 2.6);
+    const speed = Math.hypot(this.local.vx, this.local.vz);
+    const speedT = Math.min(1, speed / MAX_GROUND_SPEED);
+    const moveError = this.local.grounded ? speedT * speedT * speedT : 1;
+    this.hud.drawCrosshair({
+      moveError: this.dead ? 0 : moveError,
+      fireError: this.fireError,
+      ads: this.adsBlend,
+      hit: this.hud.hitFade,
+    });
 
     if (this.dead) {
       const remain = Math.max(0, (this.respawnAt - performance.now()) / 1000);
@@ -1102,9 +1341,9 @@ export class Game {
 
     this.hud.setNetStat([
       `${this.render.fps} fps  ${Math.round(this.render.resolutionScale * 100)}%`,
-      this.offline ? 'offline match' : `${Math.round(this.conn.rttMs)} ms rtt`,
-      `${TICK_MS.toFixed(1)} ms tick  ${this.render.drawCalls} draws`,
-      `${this.remotes.size + 1} players`,
+      this.offline ? t('hud.offlineMatch') : t('hud.rtt', { n: Math.round(this.conn.rttMs) }),
+      t('hud.tick', { ms: TICK_MS.toFixed(1), draws: this.render.drawCalls }),
+      this.remotes.size === 0 ? t('hud.playerCountOne') : t('hud.playerCount', { n: this.remotes.size + 1 }),
     ]);
 
     this.hudDamage = Math.max(0, this.hudDamage - dt * 2.2);
@@ -1140,6 +1379,11 @@ export class Game {
     const r = dx * rightX + dz * rightZ;
     return Math.atan2(r, f);
   }
+}
+
+/** Matches the i8/127 encoding in the input packet. */
+function quantAxis(v: number): number {
+  return Math.round(Math.max(-1, Math.min(1, v)) * 127) / 127;
 }
 
 function lerpAngleLocal(a: number, b: number, t: number): number {

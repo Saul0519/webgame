@@ -1,4 +1,6 @@
 import { SettingsPanel, loadSettings, saveSettings, tierName, type GameSettings } from './SettingsPanel.js';
+import { onLangChange, t } from './i18n.js';
+import { keyLabel, type KeyBinds } from './Keybinds.js';
 
 export type { GameSettings } from './SettingsPanel.js';
 
@@ -39,6 +41,9 @@ export class Menu {
   private settings: GameSettings;
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private busy = false;
+  private panel: SettingsPanel;
+  private lastRooms: RoomSummary[] = [];
+  private stopLang: () => void;
 
   constructor(parent: HTMLElement, onStart: (req: StartRequest) => Promise<void>) {
     this.settings = loadSettings();
@@ -49,41 +54,36 @@ export class Menu {
     this.root.innerHTML = `
       <div class="menu-card">
         <h1 class="brand">REACTOR</h1>
-        <p class="tagline">Multiplayer Arena FPS</p>
+        <p class="tagline"></p>
 
-        <label for="pname">Callsign</label>
-        <input id="pname" type="text" maxlength="16" placeholder="Enter a name" />
+        <label for="pname" class="l-callsign"></label>
+        <input id="pname" type="text" maxlength="16" />
 
         <div id="ponline" ${OFFLINE_ONLY ? 'hidden' : ''}>
-          <label>Live servers</label>
+          <label class="l-servers"></label>
           <div class="roomlist" id="proomlist"></div>
-          <button id="pquick">Quick match</button>
+          <button id="pquick"></button>
         </div>
 
-        <button id="psolo" class="${OFFLINE_ONLY ? '' : 'ghost'}">Solo vs bots</button>
+        <button id="psolo" class="${OFFLINE_ONLY ? '' : 'ghost'}"></button>
 
         <details class="opts">
-          <summary>Settings</summary>
+          <summary></summary>
           <div id="popts"></div>
 
-          <label for="proom">Join by match code</label>
+          <label for="proom" class="l-code"></label>
           <div class="row">
-            <input id="proom" type="text" maxlength="5" placeholder="e.g. K7QW2" autocapitalize="characters" />
-            <button class="ghost" id="pjoin" style="margin-top:0">Join</button>
+            <input id="proom" type="text" maxlength="5" autocapitalize="characters" />
+            <button class="ghost" id="pjoin" style="margin-top:0"></button>
           </div>
-          <button class="ghost" id="pcreate">Create private match</button>
+          <button class="ghost" id="pcreate"></button>
         </details>
 
         <div class="status"></div>
 
         <div class="hint">
-          Pick a server above, or hit <b>Quick match</b> for the busiest one. Bots fill
-          empty slots and step aside as players arrive — set <b>Bots: Off</b> in Settings
-          for a clean lobby. Difficulty and bot count apply to whichever room you open
-          first; joining a running match inherits its settings.<br /><br />
-          <kbd>WASD</kbd> move · <kbd>Space</kbd> jump · <kbd>Ctrl</kbd> crouch · <kbd>Shift</kbd> walk<br />
-          <kbd>LMB</kbd> fire · <kbd>RMB</kbd> aim · <kbd>R</kbd> reload · <kbd>1-4</kbd> weapons<br />
-          <kbd>Tab</kbd> scoreboard · <kbd>M</kbd> map · <kbd>Y</kbd> chat · <kbd>Esc</kbd> settings
+          <div class="hint-body"></div>
+          <div class="hint-keys"></div>
         </div>
       </div>
     `;
@@ -98,10 +98,14 @@ export class Menu {
     this.nameInput.value = this.settings.name;
 
     // One schema, rendered here and again in the in-game overlay.
-    const panel = new SettingsPanel(this.settings, () => {
-      /* saved by the panel; nothing is live until a match starts */
+    this.panel = new SettingsPanel(this.settings, () => {
+      // Rebinding a key changes the control cheatsheet below.
+      this.retranslate();
     });
-    q('#popts').appendChild(panel.root);
+    q('#popts').appendChild(this.panel.root);
+
+    this.retranslate();
+    this.stopLang = onLangChange(() => this.retranslate());
 
     // Room code in the URL hash makes matches shareable with a single link.
     const hash = location.hash.replace('#', '').toUpperCase();
@@ -128,6 +132,59 @@ export class Menu {
     }
   }
 
+  /** Rewrite every label from the dictionary and the current keybinds. */
+  private retranslate(): void {
+    const q = <T extends HTMLElement>(sel: string) => this.root.querySelector(sel) as T;
+    q('.tagline').textContent = t('menu.tagline');
+    q('.l-callsign').textContent = t('menu.callsign');
+    this.nameInput.placeholder = t('menu.namePlaceholder');
+    const servers = this.root.querySelector('.l-servers');
+    if (servers) servers.textContent = t('menu.liveServers');
+    q<HTMLButtonElement>('#pquick').textContent = t('menu.quickMatch');
+    q<HTMLButtonElement>('#psolo').textContent = t('menu.solo');
+    q('.opts summary').textContent = t('menu.settings');
+    q('.l-code').textContent = t('menu.joinByCode');
+    this.roomInput.placeholder = t('menu.codePlaceholder');
+    q<HTMLButtonElement>('#pjoin').textContent = t('menu.join');
+    q<HTMLButtonElement>('#pcreate').textContent = t('menu.createPrivate');
+    q('.hint-body').innerHTML = t('menu.hint');
+    q('.hint-keys').innerHTML = this.controlSummary();
+    if (this.lastRooms.length > 0) this.renderRooms(this.lastRooms);
+  }
+
+  /** The control cheatsheet, built from the player's actual bindings. */
+  private controlSummary(): string {
+    const b: KeyBinds = this.settings.binds;
+    const k = (code: string) => `<kbd>${escapeHtml(keyLabel(code))}</kbd>`;
+    const move = (['forward', 'left', 'back', 'right'] as const).map((a) => k(b[a])).join('');
+    const weapons = (['weapon1', 'weapon2', 'weapon3', 'weapon4'] as const).map((a) => k(b[a])).join('');
+    const line = (parts: string[]) => parts.join(' · ');
+    return (
+      `<b>${escapeHtml(t('menu.controlsTitle'))}</b><br/>` +
+      line([
+        `${move} ${escapeHtml(t('key.forward'))}`,
+        `${k(b.jump)} ${escapeHtml(t('key.jump'))}`,
+        `${k(b.crouch)} ${escapeHtml(t('key.crouch'))}`,
+        `${k(b.walk)} ${escapeHtml(t('key.walk'))}`,
+      ]) +
+      '<br/>' +
+      line([
+        `<kbd>LMB</kbd> ${escapeHtml(t('key.fire'))}`,
+        `<kbd>RMB</kbd> ${escapeHtml(t('key.ads'))}`,
+        `${k(b.reload)} ${escapeHtml(t('key.reload'))}`,
+        `${weapons} ${escapeHtml(t('key.weapons'))}`,
+      ]) +
+      '<br/>' +
+      line([
+        `${k(b.scoreboard)} ${escapeHtml(t('hud.scoreboard'))}`,
+        `${k(b.map)} ${escapeHtml(t('key.map'))}`,
+        `${k(b.chat)} ${escapeHtml(t('key.chat'))}`,
+        `${k(b.fullscreen)} ${escapeHtml(t('key.fullscreen'))}`,
+        `<kbd>Esc</kbd> ${escapeHtml(t('menu.settings'))}`,
+      ])
+    );
+  }
+
   // -------------------------------------------------------------- room browser
 
   private async refreshRooms(): Promise<void> {
@@ -138,11 +195,17 @@ export class Menu {
       const data = (await res.json()) as { rooms: RoomSummary[] };
       this.renderRooms(data.rooms);
     } catch {
-      this.roomList.innerHTML = '<div class="room-empty">Server unreachable — Solo vs bots still works.</div>';
+      this.lastRooms = [];
+      this.roomList.innerHTML = `<div class="room-empty">${escapeHtml(t('menu.serverUnreachable'))}</div>`;
     }
   }
 
   private renderRooms(rooms: RoomSummary[]): void {
+    this.lastRooms = rooms;
+    if (rooms.length === 0) {
+      this.roomList.innerHTML = `<div class="room-empty">${escapeHtml(t('menu.noRooms'))}</div>`;
+      return;
+    }
     // Busy rooms first so there is always something worth clicking at the top.
     const sorted = [...rooms].sort((a, b) => b.players - a.players || a.code.localeCompare(b.code));
     this.roomList.innerHTML = sorted
@@ -153,7 +216,7 @@ export class Menu {
           <span class="room-dot"></span>
           <span class="room-code">${escapeHtml(r.code)}</span>
           <span class="room-map">${escapeHtml(r.mapName)}${live && r.botTier ? ` · ${escapeHtml(r.botTier)}` : ''}</span>
-          <span class="room-count">${r.players}/${r.maxPlayers}${r.bots > 0 ? ` +${r.bots} bots` : ''}</span>
+          <span class="room-count">${r.players}/${r.maxPlayers}${r.bots > 0 ? ` ${escapeHtml(t('menu.botsSuffix', { n: r.bots }))}` : ''}</span>
         </button>`;
       })
       .join('');
@@ -176,7 +239,7 @@ export class Menu {
     location.hash = code;
     this.roomInput.value = code;
     this.setBusy(true);
-    this.setStatus(`Connecting to ${code}…`);
+    this.setStatus(t('menu.connecting', { code }));
     try {
       await this.onStart({
         room: code,
@@ -186,14 +249,14 @@ export class Menu {
         tier: tierName(this.settings.botSkill),
       });
     } catch (err) {
-      this.setStatus(`Connection failed: ${(err as Error).message}`, true);
+      this.setStatus(t('menu.connectFailed', { err: (err as Error).message }), true);
       this.setBusy(false);
     }
   }
 
   private async quickMatch(): Promise<void> {
     this.setBusy(true);
-    this.setStatus('Finding a match…');
+    this.setStatus(t('menu.findingMatch'));
     try {
       const res = await fetch('/api/quickmatch');
       if (!res.ok) throw new Error(`server responded ${res.status}`);
@@ -201,7 +264,7 @@ export class Menu {
       this.setBusy(false);
       await this.join(data.code);
     } catch (err) {
-      this.setStatus(`Could not reach the server: ${(err as Error).message}`, true);
+      this.setStatus(t('menu.unreachable', { err: (err as Error).message }), true);
       this.setBusy(false);
     }
   }
@@ -209,7 +272,7 @@ export class Menu {
   private async joinCode(): Promise<void> {
     const code = this.roomInput.value.trim().toUpperCase();
     if (!/^[0-9A-Z]{5}$/.test(code)) {
-      this.setStatus('Match codes are 5 characters.', true);
+      this.setStatus(t('menu.codeLength'), true);
       return;
     }
     await this.join(code);
@@ -217,7 +280,7 @@ export class Menu {
 
   private async createPrivate(): Promise<void> {
     this.setBusy(true);
-    this.setStatus('Creating match…');
+    this.setStatus(t('menu.creatingMatch'));
     try {
       const res = await fetch('/api/room', { method: 'POST' });
       if (!res.ok) throw new Error(`server responded ${res.status}`);
@@ -225,7 +288,7 @@ export class Menu {
       this.setBusy(false);
       await this.join(data.code);
     } catch (err) {
-      this.setStatus(`Could not reach the server: ${(err as Error).message}`, true);
+      this.setStatus(t('menu.unreachable', { err: (err as Error).message }), true);
       this.setBusy(false);
     }
   }
@@ -233,7 +296,7 @@ export class Menu {
   private async startSolo(): Promise<void> {
     const name = this.commitName();
     this.setBusy(true);
-    this.setStatus('Building arena…');
+    this.setStatus(t('menu.buildingArena'));
     try {
       await this.onStart({
         room: 'SOLO',
@@ -243,7 +306,7 @@ export class Menu {
         tier: tierName(this.settings.botSkill),
       });
     } catch (err) {
-      this.setStatus(`Could not start: ${(err as Error).message}`, true);
+      this.setStatus(t('menu.startFailed', { err: (err as Error).message }), true);
       this.setBusy(false);
     }
   }
@@ -280,5 +343,7 @@ export class Menu {
   dispose(): void {
     if (this.refreshTimer !== null) clearInterval(this.refreshTimer);
     this.refreshTimer = null;
+    this.stopLang();
+    this.panel.dispose();
   }
 }

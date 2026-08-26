@@ -63,20 +63,38 @@ export interface CharacterState {
   name: string;
 }
 
+/** Chakra Petch carries no Hangul, so Korean names fall through to a real face. */
+const LABEL_FONT =
+  '"Chakra Petch", "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", system-ui, sans-serif';
+const LABEL_W = 512;
+const LABEL_H = 128;
+
 function makeLabelTexture(name: string): THREE.CanvasTexture {
   const canvas = document.createElement('canvas');
-  canvas.width = 512;
-  canvas.height = 128;
+  canvas.width = LABEL_W;
+  canvas.height = LABEL_H;
   const ctx = canvas.getContext('2d')!;
-  ctx.clearRect(0, 0, 512, 128);
-  ctx.font = '600 60px "Chakra Petch", system-ui, sans-serif';
+  ctx.clearRect(0, 0, LABEL_W, LABEL_H);
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.lineWidth = 8;
+
+  // Hangul is full-width, so sixteen Korean characters are roughly twice as
+  // wide as sixteen Latin ones and ran off both ends of the plate. Shrink to
+  // fit rather than clip: a squeezed name still identifies who you are shooting.
+  let size = 60;
+  ctx.font = `600 ${size}px ${LABEL_FONT}`;
+  const maxWidth = LABEL_W - 24;
+  const width = ctx.measureText(name).width;
+  if (width > maxWidth) {
+    size = Math.max(22, Math.floor((size * maxWidth) / width));
+    ctx.font = `600 ${size}px ${LABEL_FONT}`;
+  }
+
+  ctx.lineWidth = Math.max(4, size * 0.13);
   ctx.strokeStyle = 'rgba(0,0,0,0.85)';
-  ctx.strokeText(name, 256, 64);
+  ctx.strokeText(name, LABEL_W / 2, LABEL_H / 2, maxWidth);
   ctx.fillStyle = '#e6f2ff';
-  ctx.fillText(name, 256, 64);
+  ctx.fillText(name, LABEL_W / 2, LABEL_H / 2, maxWidth);
   const tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
   return tex;

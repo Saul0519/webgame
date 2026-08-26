@@ -75,6 +75,14 @@ export interface BotTier {
   shotDrop: number;
   /** Only aim down sights beyond this range; Infinity means never. */
   adsRange: number;
+  /**
+   * How much of their movement a bot gives up to shoot, 0..1.
+   *
+   * Firing on the move is now heavily penalised, so planting before the shot is
+   * the single biggest skill in the game. Low tiers run and gun and miss;
+   * high tiers stop dead, which is what makes them feel like players.
+   */
+  stopToShoot: number;
 }
 
 export const BOT_TIERS: Record<BotTierName, BotTier> = {
@@ -94,6 +102,7 @@ export const BOT_TIERS: Record<BotTierName, BotTier> = {
     viewLatencyMs: 220,
     shotDrop: 0.35,
     adsRange: Infinity,
+    stopToShoot: 0.15,
   },
   regular: {
     name: 'regular',
@@ -111,6 +120,7 @@ export const BOT_TIERS: Record<BotTierName, BotTier> = {
     viewLatencyMs: 150,
     shotDrop: 0.15,
     adsRange: 22,
+    stopToShoot: 0.5,
   },
   veteran: {
     name: 'veteran',
@@ -128,6 +138,7 @@ export const BOT_TIERS: Record<BotTierName, BotTier> = {
     viewLatencyMs: 90,
     shotDrop: 0.05,
     adsRange: 18,
+    stopToShoot: 0.85,
   },
   elite: {
     name: 'elite',
@@ -145,6 +156,7 @@ export const BOT_TIERS: Record<BotTierName, BotTier> = {
     viewLatencyMs: 45,
     shotDrop: 0,
     adsRange: 14,
+    stopToShoot: 1,
   },
 };
 
@@ -470,6 +482,15 @@ export function botThink(b: BotBrain, view: BotView, rand: () => number, seq: nu
         b.wanderNode = -1;
       }
     }
+  }
+
+  // Plant before shooting. A bot that keeps strafing through its own burst is
+  // fighting the same movement-inaccuracy penalty a player is, and at the top
+  // tiers it should know better.
+  if ((buttons & Btn.Fire) !== 0 || (wantShoot && now < b.burstUntil)) {
+    const keep = 1 - tier.stopToShoot;
+    forward *= keep;
+    right *= keep;
   }
 
   // --- Unstick --------------------------------------------------------------

@@ -91,7 +91,13 @@ export class Writer {
 
   str(s: string): this {
     const bytes = new TextEncoder().encode(s);
-    const n = Math.min(bytes.length, 255);
+    let n = Math.min(bytes.length, 255);
+    // Back off to a codepoint boundary. The length prefix is a byte count, and
+    // one Hangul syllable is three bytes, so a flat 255-byte cut lands mid
+    // character and the far end decodes the tail as a replacement glyph.
+    if (n < bytes.length) {
+      while (n > 0 && (bytes[n] & 0xc0) === 0x80) n--;
+    }
     this.u8(n);
     this.ensure(n);
     this.u8a.set(bytes.subarray(0, n), this.off);

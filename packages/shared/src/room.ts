@@ -31,7 +31,7 @@ import {
   readInputs,
   type WireInput,
 } from './protocol.js';
-import { WEAPONS, WeaponId, damageAtRange, fireIntervalMs } from './weapons.js';
+import { WEAPONS, WeaponId, damageAtRange, fireIntervalMs, fireSpread } from './weapons.js';
 import {
   botName,
   botThink,
@@ -55,7 +55,10 @@ const MAX_CATCHUP_INPUTS = 3;
 const BOT_THINK_EVERY = 2;
 
 const CTRL_CHARS = /[\u0000-\u001f\u007f]/g;
-const NAME_BAD_CHARS = /[\u0000-\u001f\u007f<>]/g;
+// Control characters and angle brackets, plus the invisible ones: zero-width
+// joiners, the Hangul fillers (U+115F/U+1160/U+3164) and the ideographic
+// space all render as nothing, so a name made of them is a nameless player.
+const NAME_BAD_CHARS = /[\u0000-\u001f\u007f<>\u00ad\u115f\u1160\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u3000\u3164\ufeff]/g;
 
 /** Anything that can carry bytes to one connected client. */
 export interface RoomTransport {
@@ -98,7 +101,10 @@ interface RoomPlayer {
   ammo: number;
   reloadDoneAt: number;
   nextFireAt: number;
-  bloom: number;
+  /** Index within the current spray; drives both the pattern and the bloom. */
+  sprayIndex: number;
+  /** Timestamp of the last shot, so a pause can reset the spray. */
+  lastFireAt: number;
   shotCount: number;
   kills: number;
   deaths: number;
@@ -285,7 +291,8 @@ export class MatchRoom {
       ammo: WEAPONS[WeaponId.Rifle].magSize,
       reloadDoneAt: 0,
       nextFireAt: 0,
-      bloom: 0,
+      sprayIndex: 0,
+      lastFireAt: -1e9,
       shotCount: 0,
       kills: 0,
       deaths: 0,
@@ -389,7 +396,9 @@ export class MatchRoom {
           break;
         }
         case C2S.Chat: {
-          const text = r.str().slice(0, 120).replace(CTRL_CHARS, '');
+          // Slice by code point, so a Korean or emoji message is cut between
+          // characters rather than through one.
+          const text = [...r.str()].slice(0, 120).join('').replace(CTRL_CHARS, '');
           if (text.trim().length === 0) break;
           this.pushEvent(0, (w) => {
             w.u8(Ev.Chat).u8(p.id).str(text);
@@ -403,7 +412,8 @@ export class MatchRoom {
             p.ammo = WEAPONS[id2].magSize;
             p.reloadDoneAt = 0;
             p.nextFireAt = this.timeMs + 350;
-            p.bloom = 0;
+            p.sprayIndex = 0;
+            p.lastFireAt = -1e9;
           }
           break;
         }
@@ -557,8 +567,6 @@ export class MatchRoom {
       p.ammo = w.magSize;
     }
 
-    p.bloom = Math.max(0, p.bloom - w.bloomDecay * (TICK_MS / 1000));
-
     // Consume queued inputs; if the client is starved we apply a neutral input
     // so the sim keeps advancing but nothing fires on their behalf.
     let consumed = 0;
@@ -617,6 +625,11 @@ export class MatchRoom {
 
     if ((inp.buttons & Btn.Fire) !== 0) {
       this.tryFire(p, (inp.buttons & Btn.Ads) !== 0);
+    } else {
+      // Letting go of the trigger resets the pattern. Keyed on the input stream
+      // rather than a clock, so the client and the server always agree on which
+      // entry of the spray a given shot used.
+      p.sprayIndex = 0;
     }
   }
 
@@ -631,6 +644,11 @@ export class MatchRoom {
       return;
     }
 
+    // A gap in the trigger pull is what resets the pattern, so tapping is
+    // always accurate and holding the button is what costs you.
+    if (this.timeMs - p.lastFireAt > w.sprayResetMs) p.sprayIndex = 0;
+    p.lastFireAt = this.timeMs;
+
     p.ammo--;
     p.nextFireAt = this.timeMs + fireIntervalMs(w);
     p.shotCount = (p.shotCount + 1) & 0xffff;
@@ -643,7 +661,13 @@ export class MatchRoom {
     const base: Vec3 = { x: 0, y: 0, z: 0 };
     dirFromAngles(p.yaw, p.pitch, base);
 
-    const spread = (ads ? w.spreadAds : w.spreadHip) + p.bloom;
+    const spread = fireSpread(w, {
+      speed: Math.hypot(p.move.vx, p.move.vz),
+      grounded: p.move.grounded,
+      crouching: p.move.crouching,
+      ads,
+      sprayIndex: p.sprayIndex,
+    });
     const rng = mulberry32((p.id << 20) ^ (p.shotCount * 0x9e3779b1));
 
     const rewind = Math.min(Math.max(p.rewindMs, 0), LAGCOMP_MAX_REWIND_MS);
@@ -661,7 +685,7 @@ export class MatchRoom {
       this.resolvePellet(p, w.id, eyeX, eyeY, eyeZ, dir, rewindTime);
     }
 
-    p.bloom = Math.min(w.bloomMax, p.bloom + w.bloomPerShot);
+    p.sprayIndex++;
 
     const pid = p.id;
     const wid = p.weapon;
@@ -804,7 +828,8 @@ export class MatchRoom {
     p.protectedUntil = this.timeMs + SPAWN_PROTECTION_MS;
     p.ammo = WEAPONS[p.weapon].magSize;
     p.reloadDoneAt = 0;
-    p.bloom = 0;
+    p.sprayIndex = 0;
+    p.lastFireAt = -1e9;
     p.history.length = 0;
     if (p.brain) {
       p.brain.yaw = spawn.yaw;
@@ -968,7 +993,11 @@ export class MatchRoom {
 }
 
 function sanitiseName(raw: string): string {
-  return raw.replace(NAME_BAD_CHARS, '').trim().slice(0, NAME_MAX_LEN);
+  // Normalise first: Hangul typed as separate jamo composes to the same
+  // syllables the player sees, so the length limit counts what they see too.
+  // Slicing by code point keeps a surrogate pair from being cut in half.
+  const clean = raw.normalize('NFC').replace(NAME_BAD_CHARS, '').trim();
+  return [...clean].slice(0, NAME_MAX_LEN).join('');
 }
 
 function sampleHistory(p: RoomPlayer, t: number): HistorySample {

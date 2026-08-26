@@ -12,6 +12,47 @@
   --mono: 'JetBrains Mono', ui-monospace, monospace;
 }
 
+/* Chakra Petch has no Hangul, so Korean would land on whatever the OS picked.
+   Keeping it first in the stack means Latin and digits still get the game face
+   while Hangul falls through, glyph by glyph, to a real Korean face. */
+html[data-lang='ko'] {
+  --font: 'Chakra Petch', 'Pretendard Variable', Pretendard, 'Apple SD Gothic Neo', 'Noto Sans KR',
+    'Malgun Gothic', system-ui, sans-serif;
+  --mono: 'JetBrains Mono', 'Apple SD Gothic Neo', 'Noto Sans KR', 'Malgun Gothic', ui-monospace, monospace;
+}
+/* Hangul sits taller than Latin at the same size and needs the extra leading. */
+html[data-lang='ko'] body { line-height: 1.55; }
+/* Wide tracking is a Latin display trick. Hangul syllables are already
+   full-width blocks, so 0.14-0.3em pulls them apart into loose rubble; and
+   uppercasing does nothing to them while still applying to any Latin in the
+   same label, which then no longer matches. Reset both wherever the UI sets
+   them — except the REACTOR wordmark and the match codes, which are Latin by
+   definition and keep their spacing in every language. */
+html[data-lang='ko']
+  :is(
+    label,
+    summary,
+    .tagline,
+    .settings-title,
+    .setting label,
+    .stat-label,
+    .weapon-name,
+    .dead-title,
+    .scoreboard h3,
+    th,
+    .pause-card h2,
+    .hint-keys b,
+    .matchbar,
+    .toast,
+    .pointerhint,
+    .room-map,
+    .kf-row,
+    button
+  ) {
+  letter-spacing: 0.02em;
+  text-transform: none;
+}
+
 * { box-sizing: border-box; }
 
 html, body {
@@ -145,7 +186,15 @@ button.ghost { background: transparent; border-color: var(--edge); color: var(--
   align-items: flex-end;
   gap: 18px;
 }
-.stat-label { font-size: 11px; letter-spacing: 0.18em; color: var(--muted); text-transform: uppercase; }
+.stat-label {
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  color: var(--muted);
+  text-transform: uppercase;
+  /* The arena has bright concrete and a bright sky; muted grey on its own
+     disappears against both. */
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+}
 .stat-value { font-family: var(--mono); font-size: 40px; font-weight: 700; line-height: 1; text-shadow: 0 2px 12px rgba(0,0,0,0.8); }
 .hp-bar { width: 190px; height: 5px; margin-top: 8px; background: rgba(255,255,255,0.12); border-radius: 3px; overflow: hidden; }
 .hp-fill { height: 100%; width: 100%; background: linear-gradient(90deg, #6ee787, #3ec46b); transition: width 0.12s linear; }
@@ -159,7 +208,14 @@ button.ghost { background: transparent; border-color: var(--edge); color: var(--
 }
 .ammo .stat-value { font-size: 44px; }
 .ammo .mag { color: var(--muted); font-size: 22px; }
-.weapon-name { font-size: 12px; letter-spacing: 0.18em; color: var(--muted); text-transform: uppercase; margin-top: 4px; }
+.weapon-name {
+  font-size: 12px;
+  letter-spacing: 0.18em;
+  color: var(--muted);
+  text-transform: uppercase;
+  margin-top: 4px;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+}
 .reloading { color: var(--accent); animation: pulse 0.9s ease-in-out infinite; }
 @keyframes pulse { 0%,100% { opacity: 0.45; } 50% { opacity: 1; } }
 
@@ -464,3 +520,130 @@ label.check input { accent-color: var(--accent); }
 }
 .pause-actions { display: flex; gap: 10px; margin-top: 18px; }
 .pause-actions button { margin-top: 0; }
+
+
+/* -------------------------------------------------------------- sniper scope */
+
+.scope {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  z-index: 11;
+  pointer-events: none;
+}
+/* The scope surround is opaque, so anything you still need while holding an
+   angle — health, ammo, the round timer, the killfeed — has to sit above it. */
+.vitals,
+.ammo,
+.matchbar,
+.killfeed,
+.netstat,
+.chatlog,
+.toast,
+.minimap,
+.hitmarker,
+.damage-vignette { z-index: 12; }
+
+/* Hangul has no capitals, so the uppercase micro-labels lose the size cue that
+   makes them read at 11px. Give the Korean ones a little more to work with. */
+html[data-lang='ko'] .stat-label,
+html[data-lang='ko'] .weapon-name { font-size: 13px; }
+
+/* ------------------------------------------------------------ settings extras */
+
+.setting-help {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--muted);
+  margin-top: 2px;
+}
+.setting-help.warn { color: #ffc46e; }
+
+/* Keybinds ------------------------------------------------------------------ */
+
+.bindlist { display: flex; flex-direction: column; gap: 4px; }
+.bindrow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 3px 0;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+button.bind {
+  margin-top: 0;
+  min-width: 92px;
+  padding: 5px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+button.bind.capturing { border-color: var(--accent); color: var(--accent); }
+button.bind.risky { border-color: #ffc46e; color: #ffc46e; }
+
+/* Crosshair editor ---------------------------------------------------------- */
+
+.xh-editor { gap: 10px; }
+.xh-preview {
+  align-self: center;
+  width: 132px;
+  height: 132px;
+  border: 1px solid var(--edge);
+  border-radius: 10px;
+  /* A mid-grey field: a crosshair that only reads on black is not a crosshair. */
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0) 60%),
+    repeating-linear-gradient(45deg, #2b3441 0 8px, #313b4a 8px 16px);
+}
+.xh-swatches { align-items: center; }
+button.xh-swatch {
+  flex: 0 0 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 6px;
+  background: var(--sw);
+  border: 2px solid transparent;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.45);
+}
+button.xh-swatch.on { border-color: var(--text); }
+input.xh-colour {
+  flex: 0 0 34px;
+  height: 26px;
+  padding: 0 2px;
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+}
+.xh-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--edge);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.xh-sub .settings-title { margin-bottom: 2px; }
+input.xh-code {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+/* Menu control cheatsheet --------------------------------------------------- */
+
+.hint-keys { margin-top: 14px; }
+.hint-keys b {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}

@@ -1,4 +1,5 @@
 import { SettingsPanel, type GameSettings } from './SettingsPanel.js';
+import { onLangChange, t } from './i18n.js';
 
 /**
  * In-game settings, shown whenever pointer lock is lost.
@@ -14,6 +15,10 @@ export class PauseOverlay {
   private open = false;
   private readonly onResume: () => void;
   private readonly onQuit: () => void;
+  private readonly title: HTMLElement;
+  private readonly resumeBtn: HTMLButtonElement;
+  private readonly quitBtn: HTMLButtonElement;
+  private readonly stopLang: () => void;
 
   constructor(
     parent: HTMLElement,
@@ -31,7 +36,7 @@ export class PauseOverlay {
     card.className = 'pause-card';
 
     const title = document.createElement('h2');
-    title.textContent = 'Settings';
+    this.title = title;
     card.appendChild(title);
 
     // Match options are decided when a match starts, so they would be a lie here.
@@ -41,17 +46,20 @@ export class PauseOverlay {
     const actionsRow = document.createElement('div');
     actionsRow.className = 'pause-actions';
     const resume = document.createElement('button');
-    resume.textContent = 'Resume';
+    this.resumeBtn = resume;
     resume.addEventListener('click', () => this.onResume());
     const quit = document.createElement('button');
+    this.quitBtn = quit;
     quit.className = 'ghost';
-    quit.textContent = 'Leave match';
     quit.addEventListener('click', () => this.onQuit());
     actionsRow.append(resume, quit);
     card.appendChild(actionsRow);
 
     this.root.appendChild(card);
     parent.appendChild(this.root);
+
+    this.retranslate();
+    this.stopLang = onLangChange(() => this.retranslate());
 
     // The overlay itself is not pointer-locked, so it receives Escape normally.
     this.root.addEventListener('keydown', (e) => {
@@ -60,6 +68,12 @@ export class PauseOverlay {
         this.onResume();
       }
     });
+  }
+
+  private retranslate(): void {
+    this.title.textContent = t('pause.title');
+    this.resumeBtn.textContent = t('pause.resume');
+    this.quitBtn.textContent = t('pause.leave');
   }
 
   get isOpen(): boolean {
@@ -79,6 +93,8 @@ export class PauseOverlay {
   }
 
   dispose(): void {
+    this.stopLang();
+    this.panel.dispose();
     this.root.remove();
   }
 }

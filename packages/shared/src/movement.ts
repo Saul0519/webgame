@@ -1,5 +1,6 @@
 import {
   AIR_ACCEL,
+  AIR_SPEED_CAP,
   Btn,
   COYOTE_TICKS,
   EYE_HEIGHT,
@@ -8,6 +9,8 @@ import {
   GRAVITY,
   GROUND_ACCEL,
   JUMP_VELOCITY,
+  LAND_SPEED_KEEP,
+  LAND_TAX_MIN_AIR_TICKS,
   MAX_AIR_SPEED,
   MAX_CROUCH_SPEED,
   MAX_FALL_SPEED,
@@ -257,6 +260,15 @@ export function simulateMovement(s: MoveState, input: MoveInput, world: Collisio
   } else {
     const airWish = Math.min(wishSpeed, MAX_AIR_SPEED);
     accelerate(s, wnx, wnz, airWish, AIR_ACCEL);
+    // Hard horizontal cap in the air. Without it, turning into the wish
+    // direction each tick converts air acceleration into free speed, which is
+    // the strafe-jumping the tactical feel is meant to rule out.
+    const airSpeed = Math.hypot(s.vx, s.vz);
+    if (airSpeed > AIR_SPEED_CAP) {
+      const k = AIR_SPEED_CAP / airSpeed;
+      s.vx *= k;
+      s.vz *= k;
+    }
     s.vy -= GRAVITY * TICK_DT;
     if (s.vy < -MAX_FALL_SPEED) s.vy = -MAX_FALL_SPEED;
   }
@@ -264,8 +276,20 @@ export function simulateMovement(s: MoveState, input: MoveInput, world: Collisio
   slideMove(s, world, TICK_DT);
 
   // Re-evaluate ground after moving so the flag we report matches the position.
+  const wasAirborne = !s.grounded;
+  const airTicksBefore = s.airTicks;
   s.grounded = checkGround(s, world);
   if (s.grounded && s.vy < 0) s.vy = 0;
+  // Touching down costs tempo, so a jump is a commitment rather than a way to
+  // carry speed through a corner.
+  //
+  // Only a real jump though. The ground probe only reaches 0.06 m, so walking
+  // down a step or over a lip reads as airborne for a few ticks; taxing those
+  // would decay a run down a staircase to a crawl, one step at a time.
+  if (s.grounded && wasAirborne && airTicksBefore >= LAND_TAX_MIN_AIR_TICKS) {
+    s.vx *= LAND_SPEED_KEEP;
+    s.vz *= LAND_SPEED_KEEP;
+  }
 
   // Smooth the eye height toward the stance target (cosmetic, but keep it in
   // the shared sim so the server's lag-comp head position matches the client).

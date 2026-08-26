@@ -9,6 +9,7 @@ export class AudioEngine {
   private master: GainNode | null = null;
   private noiseBuf: AudioBuffer | null = null;
   private muted = false;
+  private level = 0.55;
 
   ensure(): void {
     if (this.ctx) {
@@ -18,7 +19,7 @@ export class AudioEngine {
     const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     this.ctx = new Ctor();
     this.master = this.ctx.createGain();
-    this.master.gain.value = 0.55;
+    this.master.gain.value = this.muted ? 0 : this.level;
     const comp = this.ctx.createDynamicsCompressor();
     comp.threshold.value = -14;
     comp.ratio.value = 8;
@@ -35,7 +36,20 @@ export class AudioEngine {
 
   setMuted(m: boolean): void {
     this.muted = m;
-    if (this.master) this.master.gain.value = m ? 0 : 0.55;
+    this.applyGain();
+  }
+
+  /** 0..1 master volume. */
+  setVolume(v: number): void {
+    this.level = Math.max(0, Math.min(1, v));
+    this.applyGain();
+  }
+
+  private applyGain(): void {
+    if (!this.master || !this.ctx) return;
+    const target = this.muted ? 0 : this.level;
+    // Ramp rather than jump: a step change on a gain node clicks audibly.
+    this.master.gain.setTargetAtTime(target, this.ctx.currentTime, 0.02);
   }
 
   get isMuted(): boolean {

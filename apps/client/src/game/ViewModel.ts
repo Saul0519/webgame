@@ -169,6 +169,8 @@ export class ViewModel {
   private muzzleLight: THREE.PointLight;
   private muzzleSprite: THREE.Sprite;
   private flashT = 0;
+  private swayScale = 1;
+  private bobScale = 1;
   private readonly muzzleScratch = new THREE.Vector3();
 
   constructor(fov: number) {
@@ -221,6 +223,12 @@ export class ViewModel {
     this.recoilPos = 0.06;
   }
 
+  /** 0 disables the motion entirely, for players who find it nauseating. */
+  setStyle(sway: number, bob: number): void {
+    this.swayScale = Math.max(0, sway);
+    this.bobScale = Math.max(0, bob);
+  }
+
   setEnvironment(env: THREE.Texture | null): void {
     this.scene.environment = env;
     this.scene.environmentIntensity = 0.75;
@@ -254,8 +262,9 @@ export class ViewModel {
     const { lookDx, lookDy, speed, grounded, ads } = opts;
 
     // Sway trails the mouse, then springs back.
-    this.swayX += (-lookDx * 0.45 - this.swayX) * Math.min(1, 26 * dt);
-    this.swayY += (-lookDy * 0.45 - this.swayY) * Math.min(1, 26 * dt);
+    const swayGain = 0.45 * this.swayScale;
+    this.swayX += (-lookDx * swayGain - this.swayX) * Math.min(1, 26 * dt);
+    this.swayY += (-lookDy * swayGain - this.swayY) * Math.min(1, 26 * dt);
     this.swayX *= 1 - Math.min(1, 9 * dt);
     this.swayY *= 1 - Math.min(1, 9 * dt);
 
@@ -264,7 +273,7 @@ export class ViewModel {
 
     const moving = grounded && speed > 0.6;
     this.bobT += dt * (moving ? 5.5 + speed * 0.75 : 2.2);
-    const bobAmp = (moving ? Math.min(1, speed / 7) : 0.12) * (1 - adsEase * 0.75);
+    const bobAmp = (moving ? Math.min(1, speed / 7) : 0.12) * (1 - adsEase * 0.75) * this.bobScale;
     const bobX = Math.sin(this.bobT) * 0.016 * bobAmp;
     const bobY = Math.abs(Math.cos(this.bobT)) * 0.013 * bobAmp;
 

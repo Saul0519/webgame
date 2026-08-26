@@ -1,5 +1,4 @@
 import * as THREE from 'three';
-import { Sky } from 'three/addons/objects/Sky.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
@@ -33,6 +32,20 @@ const TIERS: Record<Quality, Tier> = {
 /** Dynamic resolution never drops below this fraction of the chosen scale. */
 const MIN_DYNAMIC_SCALE = 0.55;
 
+/** Exposure at brightness 1.0. Tuned so the sky peaks just under clipping. */
+const BASE_EXPOSURE = 1.05;
+
+const GRADE_VIGNETTE = 0.5;
+const GRADE_GRAIN = 0.022;
+const GRADE_ABERRATION = 0.0007;
+
+/** Shared sky palette. Deliberately below 1.0 so nothing clips to white. */
+const SKY_ZENITH = 0x3d7fc4;
+const SKY_HORIZON = 0xc8d9e8;
+const SKY_GROUND = 0x6b6358;
+const SKY_ZENITH_SCALE = 0.64;
+const SKY_HORIZON_SCALE = 1.05;
+
 /** Sky dome radius. Must stay inside the camera far plane or the backdrop and
  * the IBL capture both clip away to black. */
 const SKY_RADIUS = 900;
@@ -44,7 +57,7 @@ const GradeShader = {
   uniforms: {
     tDiffuse: { value: null as THREE.Texture | null },
     uTime: { value: 0 },
-    uVignette: { value: 0.9 },
+    uVignette: { value: 0.62 },
     uGrain: { value: 0.022 },
     uAberration: { value: 0.0007 },
     uDamage: { value: 0 },
@@ -79,7 +92,7 @@ const GradeShader = {
       col.b = texture2D(tDiffuse, vUv - c * ab).b;
 
       float vig = smoothstep(0.95, 0.25, r2 * uVignette * 2.2);
-      col *= mix(1.0, vig, 0.75);
+      col *= mix(1.0, vig, 0.5);
 
       float g = hash(vUv * vec2(1024.0, 1024.0) + fract(uTime) * 91.7) - 0.5;
       col += g * uGrain;
@@ -114,6 +127,7 @@ export class RenderSystem {
   private frameMs = 16.7;
   private lastScaleCheck = 0;
   private lastFrameStamp = 0;
+  private screenEffects = true;
   private time = 0;
   private vmScene: THREE.Scene | null = null;
   private vmCamera: THREE.Camera | null = null;
@@ -131,7 +145,7 @@ export class RenderSystem {
     });
     this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 0.58;
+    this.renderer.toneMappingExposure = BASE_EXPOSURE;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.info.autoReset = false;
@@ -154,35 +168,27 @@ export class RenderSystem {
     const [dx, dy, dz] = map.sun.dir;
     const sunPos = new THREE.Vector3(-dx, -dy, -dz).normalize();
 
-    // Physical sky, both as the visible backdrop and as the IBL source. This is
-    // what gives metal its blue sheen and shaded faces their bounce light.
-    const sky = new Sky();
-    sky.scale.setScalar(SKY_RADIUS);
-    const u = sky.material.uniforms;
-    u.turbidity.value = 6.5;
-    u.rayleigh.value = 1.1;
-    u.mieCoefficient.value = 0.006;
-    u.mieDirectionalG.value = 0.82;
-    sky.material.toneMapped = true;
-    u.sunPosition.value.copy(sunPos);
-    if (lowSpec) {
-      sky.geometry.dispose();
-      sky.material.dispose();
-      this.scene.background = new THREE.Color(0x6b7d91);
-    } else {
-      this.scene.add(sky);
-    }
+    // A hand-built gradient dome rather than the physical sky shader. The
+    // atmospheric model outputs radiance far above 1.0, so even after ACES the
+    // open roof clipped to a flat white sheet that bloom then smeared over the
+    // arena. Driving the same palette that bakes the environment map keeps the
+    // backdrop and the lighting in agreement, and the brightest texel is a
+    // value we chose.
+    const segments = lowSpec ? 16 : 32;
+    const dome = new THREE.Mesh(
+      new THREE.SphereGeometry(SKY_RADIUS, segments, segments / 2),
+      makeSkyMaterial(sunPos),
+    );
+    dome.name = 'sky';
+    dome.frustumCulled = false;
+    this.scene.add(dome);
 
-    // IBL comes from a hand-built gradient rather than from prefiltering the sky
-    // itself: the physical sky's solar disc exceeds half-float range, and the
-    // resulting Inf/NaN in the environment map turns every lit surface black
-    // (and then spreads across the whole frame through the bloom blur).
     const envTex = buildSkyEnvTexture(sunPos, new THREE.Color(map.sun.color));
     const pmrem = new THREE.PMREMGenerator(this.renderer);
     this.envRT?.dispose();
     this.envRT = pmrem.fromEquirectangular(envTex);
     this.scene.environment = this.envRT.texture;
-    this.scene.environmentIntensity = lowSpec ? 0.65 : 0.5;
+    this.scene.environmentIntensity = lowSpec ? 1.2 : 1.1;
     pmrem.dispose();
     envTex.dispose();
 
@@ -192,6 +198,7 @@ export class RenderSystem {
     this.sun.intensity = map.sun.intensity;
     this.sunDir.set(dx, dy, dz).normalize();
     this.sun.target.position.set(0, 0, 0);
+    this.sun.position.set(-this.sunDir.x * 80, -this.sunDir.y * 80, -this.sunDir.z * 80);
     this.sun.castShadow = true;
     const span = Math.max(map.bounds.max[0] - map.bounds.min[0], map.bounds.max[2] - map.bounds.min[2]) * 0.62;
     const cam = this.sun.shadow.camera;
@@ -214,7 +221,7 @@ export class RenderSystem {
       }
     }
 
-    const hemi = new THREE.HemisphereLight(0xbcd4ff, 0x2a2620, lowSpec ? 0.34 : 0.22);
+    const hemi = new THREE.HemisphereLight(0xbcd4ff, 0x4a4238, lowSpec ? 1.6 : 1.4);
     this.scene.add(hemi);
   }
 
@@ -336,17 +343,46 @@ export class RenderSystem {
       this.bloom = null;
     }
 
+    composer.addPass(new OutputPass());
+
     const grade = new ShaderPass(GradeShader);
     composer.addPass(grade);
     this.gradePass = grade;
+    // Re-assert the player's choice: rebuilding the chain resets the uniforms.
+    this.applyScreenEffects();
 
-    composer.addPass(new OutputPass());
     if (this.tier.smaa) composer.addPass(new SMAAPass());
     this.composer = composer;
   }
 
   setDamageFlash(v: number): void {
     if (this.gradePass) this.gradePass.uniforms.uDamage.value = v;
+  }
+
+  /**
+   * Film grain, vignette and chromatic aberration. Some players read these as
+   * smearing or find them nauseating, so they are one switch.
+   */
+  /**
+   * 0.6..1.6 multiplier on exposure. Monitors and rooms vary far more than any
+   * single tuned value can cover, so this is a control rather than a constant.
+   */
+  setBrightness(v: number): void {
+    const k = Number.isFinite(v) ? Math.max(0.5, Math.min(2, v)) : 1;
+    this.renderer.toneMappingExposure = BASE_EXPOSURE * k;
+  }
+
+  setScreenEffects(on: boolean): void {
+    this.screenEffects = on;
+    this.applyScreenEffects();
+  }
+
+  private applyScreenEffects(): void {
+    if (!this.gradePass) return;
+    const u = this.gradePass.uniforms;
+    u.uGrain.value = this.screenEffects ? GRADE_GRAIN : 0;
+    u.uVignette.value = this.screenEffects ? GRADE_VIGNETTE : 0;
+    u.uAberration.value = this.screenEffects ? GRADE_ABERRATION : 0;
   }
 
   resize(): void {
@@ -368,11 +404,10 @@ export class RenderSystem {
     this.time += dt;
     this.renderer.info.reset();
     this.governResolution();
-    // Keep the sun rig centred on the player so the shadow map stays tight.
-    const focusX = this.camera.position.x;
-    const focusZ = this.camera.position.z;
-    this.sun.target.position.set(focusX, 0, focusZ);
-    this.sun.position.set(focusX - this.sunDir.x * 80, -this.sunDir.y * 80, focusZ - this.sunDir.z * 80);
+    // The rig is fixed on the arena rather than following the player: the map is
+    // 68m across and the frustum is 84m, so one map covers all of it. Following
+    // the camera left the far side outside the frustum, where three's shadow
+    // lookup returns "lit" and the roofed ring popped as you walked toward it.
     this.sun.target.updateMatrixWorld();
 
     if (this.gradePass) this.gradePass.uniforms.uTime.value = this.time;
@@ -407,9 +442,9 @@ function buildSkyEnvTexture(sunDir: THREE.Vector3, sunColour: THREE.Color): THRE
   const W = 256;
   const H = 128;
   const data = new Float32Array(W * H * 4);
-  const zenith = new THREE.Color(0x3d7fc4);
-  const horizon = new THREE.Color(0xc8d9e8);
-  const ground = new THREE.Color(0x3a342c);
+  const zenith = new THREE.Color(SKY_ZENITH);
+  const horizon = new THREE.Color(SKY_HORIZON);
+  const ground = new THREE.Color(SKY_GROUND);
 
   for (let y = 0; y < H; y++) {
     const theta = ((y + 0.5) / H) * Math.PI; // 0 at the zenith
@@ -430,14 +465,14 @@ function buildSkyEnvTexture(sunDir: THREE.Vector3, sunColour: THREE.Color): THRE
         r = zenith.r + (horizon.r - zenith.r) * t;
         g = zenith.g + (horizon.g - zenith.g) * t;
         b = zenith.b + (horizon.b - zenith.b) * t;
-        const scale = 0.7 + t * 0.45;
+        const scale = SKY_ZENITH_SCALE + t * (SKY_HORIZON_SCALE - SKY_ZENITH_SCALE);
         r *= scale;
         g *= scale;
         b *= scale;
       } else {
         // Ground bounce, fading out with depth below the horizon.
         const t = Math.min(1, -dy * 3);
-        const scale = 0.38 * (1 - t * 0.6);
+        const scale = 1.1 * (1 - t * 0.45);
         r = ground.r * scale;
         g = ground.g * scale;
         b = ground.b * scale;
@@ -465,4 +500,54 @@ function buildSkyEnvTexture(sunDir: THREE.Vector3, sunColour: THREE.Color): THRE
   tex.minFilter = THREE.LinearFilter;
   tex.needsUpdate = true;
   return tex;
+}
+
+/**
+ * Gradient sky dome matching `buildSkyEnvTexture`. Values stay under 1.2 so the
+ * tone mapper has headroom and the sky never becomes a white cut-out.
+ */
+function makeSkyMaterial(sunDir: THREE.Vector3): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    side: THREE.BackSide,
+    depthWrite: false,
+    fog: false,
+    uniforms: {
+      uZenith: { value: new THREE.Color(SKY_ZENITH).multiplyScalar(SKY_ZENITH_SCALE) },
+      uHorizon: { value: new THREE.Color(SKY_HORIZON).multiplyScalar(SKY_HORIZON_SCALE) },
+      uGround: { value: new THREE.Color(SKY_GROUND).multiplyScalar(0.55) },
+      uSunDir: { value: sunDir.clone() },
+      uSunColour: { value: new THREE.Color(0xfff0d8) },
+    },
+    vertexShader: /* glsl */ `
+      varying vec3 vDir;
+      void main() {
+        vDir = (modelMatrix * vec4(position, 1.0)).xyz - cameraPosition;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform vec3 uZenith;
+      uniform vec3 uHorizon;
+      uniform vec3 uGround;
+      uniform vec3 uSunDir;
+      uniform vec3 uSunColour;
+      varying vec3 vDir;
+
+      void main() {
+        vec3 dir = normalize(vDir);
+        vec3 col;
+        if (dir.y >= 0.0) {
+          col = mix(uHorizon, uZenith, pow(clamp(dir.y, 0.0, 1.0), 0.45));
+        } else {
+          col = mix(uHorizon, uGround, clamp(-dir.y * 3.0, 0.0, 1.0));
+        }
+        // Soft, bounded sun. A hard disc is what reads as a blown-out hole.
+        float d = max(dot(dir, uSunDir), 0.0);
+        col += uSunColour * (pow(d, 1200.0) * 1.1 + pow(d, 26.0) * 0.22);
+        // OutputPass owns tone mapping and the colour space conversion; every
+        // scene material renders into a linear target.
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `,
+  });
 }

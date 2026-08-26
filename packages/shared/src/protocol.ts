@@ -37,10 +37,15 @@ const ANGLE_SCALE = 32767 / Math.PI;
 const VEL_SCALE = 128; // +-255 m/s in an int16
 const DIR_SCALE = 32767;
 
+const TAU = Math.PI * 2;
+
 export const packAngle = (a: number): number => {
-  let x = a;
-  while (x > Math.PI) x -= Math.PI * 2;
-  while (x < -Math.PI) x += Math.PI * 2;
+  // Modulo rather than a subtract loop: the loop never terminates on a
+  // non-finite angle, which would hard-lock the tab instead of failing loudly.
+  if (!Number.isFinite(a)) return 0;
+  let x = a % TAU;
+  if (x > Math.PI) x -= TAU;
+  else if (x < -Math.PI) x += TAU;
   return Math.round(x * ANGLE_SCALE);
 };
 export const unpackAngle = (q: number): number => q / ANGLE_SCALE;

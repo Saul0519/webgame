@@ -1,9 +1,9 @@
-import { MatchRoom, TICK_MS, type RoomTransport } from '@webgame/shared';
+import { MatchRoom, TICK_MS, type BotTierName, type RoomTransport } from '@webgame/shared';
 import type { Env } from './index.js';
 
 /** Keep matches lively even when only one or two people are online. */
 const FILL_TO = 6;
-const BOT_SKILL = 0.55;
+const BOT_TIER: BotTierName = 'regular';
 
 /**
  * Durable Object wrapper around the shared match simulation. Its only jobs are
@@ -19,7 +19,7 @@ export class GameRoom implements DurableObject {
   constructor(_state: DurableObjectState, _env: Env) {
     this.room = new MatchRoom({
       fillTo: FILL_TO,
-      botSkill: BOT_SKILL,
+      botTier: BOT_TIER,
       seed: (Date.now() ^ 0x5bf03635) >>> 0,
     });
   }
@@ -51,9 +51,12 @@ export class GameRoom implements DurableObject {
       send: (data) => server.send(data),
       close: (code, reason) => server.close(code, reason),
     };
-    // The first person into an empty room decides whether bots fill it out.
+    // The first person into an empty room decides how many bots there are and
+    // how hard they play. Later joiners inherit it, so the choice cannot be
+    // used to reset a match that is already running.
     if (this.room.humanCount === 0) {
       const wanted = Number(url.searchParams.get('bots'));
+      this.room.setBotTier((url.searchParams.get('tier') ?? undefined) as BotTierName | undefined);
       this.room.setFillTo(Number.isFinite(wanted) && wanted >= 0 ? wanted : FILL_TO);
     }
 

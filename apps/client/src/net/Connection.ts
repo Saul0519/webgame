@@ -62,7 +62,7 @@ export interface Welcome {
 export interface GameConnection {
   readonly rttMs: number;
   readonly open: boolean;
-  connect(room: string, name: string, bots?: number): Promise<void>;
+  connect(room: string, name: string, bots?: number, tier?: string): Promise<void>;
   close(): void;
   sendInputs(inputs: WireInput[], rewindMs: number): void;
   sendRespawn(): void;
@@ -99,10 +99,11 @@ export class Connection implements GameConnection {
     return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
   }
 
-  connect(room: string, name: string, bots?: number): Promise<void> {
+  connect(room: string, name: string, bots?: number, tier?: string): Promise<void> {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const botParam = bots === undefined ? '' : `&bots=${Math.max(0, Math.min(11, Math.round(bots)))}`;
-    const url = `${proto}//${location.host}/ws?room=${encodeURIComponent(room)}&name=${encodeURIComponent(name)}${botParam}`;
+    const tierParam = tier ? `&tier=${encodeURIComponent(tier)}` : '';
+    const url = `${proto}//${location.host}/ws?room=${encodeURIComponent(room)}&name=${encodeURIComponent(name)}${botParam}${tierParam}`;
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
     this.ws = ws;

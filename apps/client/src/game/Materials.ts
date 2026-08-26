@@ -67,7 +67,9 @@ const RECIPES: Partial<Record<Surface, SurfaceRecipe>> = {
       const n = fbm(u * 8, v * 8, 5, 4, 11);
       const speck = valueNoise(u * 220, v * 220, 220, 5) > 0.93 ? 0.14 : 0;
       const seam = grid(u, v, 2, 0.02) * 0.5;
-      const base = 0.30 + n * 0.16 + speck - seam * 0.5;
+      // 0.44 sRGB ~= 0.23 linear, in the range real dry concrete actually sits;
+      // the old 0.30 was closer to weathered asphalt and made everything dark.
+      const base = 0.44 + n * 0.16 + speck - seam * 0.5;
       return [base * 1.0, base * 1.0, base * 1.03, n * 0.7 - seam];
     },
     metalness: 0.02,
@@ -80,7 +82,7 @@ const RECIPES: Partial<Record<Surface, SurfaceRecipe>> = {
       const brush = fbm(u * 60, v * 3, 4, 8, 23);
       const panel = grid(u, v, 4, 0.012);
       const rivet = valueNoise(u * 32, v * 32, 32, 9) > 0.97 ? 0.2 : 0;
-      const base = 0.42 + brush * 0.14 - panel * 0.28 + rivet;
+      const base = 0.50 + brush * 0.14 - panel * 0.28 + rivet;
       return [base * 0.94, base * 0.98, base * 1.06, brush * 0.5 - panel * 1.2 + rivet];
     },
     metalness: 0.92,
@@ -108,7 +110,7 @@ const RECIPES: Partial<Record<Surface, SurfaceRecipe>> = {
     shade: (u, v) => {
       const holes = grid(u, v, 16, 0.35);
       const dirt = fbm(u * 10, v * 10, 3, 5, 51);
-      const base = 0.14 + holes * 0.3 + dirt * 0.06;
+      const base = 0.22 + holes * 0.3 + dirt * 0.06;
       return [base, base * 1.02, base * 1.08, holes * 2 - 1];
     },
     metalness: 0.85,

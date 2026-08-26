@@ -51,8 +51,16 @@ export class Minimap {
   }
 
   /** Cycles off → small → large. */
-  cycle(): void {
+  cycle(): number {
     this.mode = ((this.mode + 1) % 3) as 0 | 1 | 2;
+    this.applyMode();
+    return this.mode;
+  }
+
+  setMode(mode: number): void {
+    const next = (Math.max(0, Math.min(2, Math.round(mode))) | 0) as 0 | 1 | 2;
+    if (next === this.mode) return;
+    this.mode = next;
     this.applyMode();
   }
 

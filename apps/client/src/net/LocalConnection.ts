@@ -1,12 +1,20 @@
-import { C2S, MatchRoom, TICK_MS, Writer, writeInputs, type RoomTransport, type WireInput } from '@webgame/shared';
+import {
+  C2S,
+  MatchRoom,
+  TICK_MS,
+  Writer,
+  writeInputs,
+  type BotTierName,
+  type RoomTransport,
+  type WireInput,
+} from '@webgame/shared';
 import type { ConnectionHandlers, GameConnection } from './Connection.js';
 import { Connection } from './Connection.js';
 
 export interface LocalMatchOptions {
   /** Total participants including the human player. */
   fillTo: number;
-  /** 0..1 */
-  botSkill: number;
+  botTier: BotTierName;
 }
 
 /**
@@ -37,10 +45,10 @@ export class LocalConnection implements GameConnection {
     return this.room !== null && !this.closed;
   }
 
-  async connect(_room: string, name: string, bots?: number): Promise<void> {
+  async connect(_room: string, name: string, bots?: number, tier?: string): Promise<void> {
     const room = new MatchRoom({
       fillTo: bots === undefined ? this.opts.fillTo : Math.max(0, bots),
-      botSkill: this.opts.botSkill,
+      botTier: (tier as BotTierName | undefined) ?? this.opts.botTier,
       seed: (Math.floor(performance.now() * 1000) ^ 0x2545f491) >>> 0,
     });
     const transport: RoomTransport = {

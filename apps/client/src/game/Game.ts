@@ -33,8 +33,18 @@ import { Effects } from './Effects.js';
 import { AudioEngine } from './AudioEngine.js';
 import type { Hud, ScoreRow } from '../ui/Hud.js';
 import { Minimap } from '../ui/Minimap.js';
+import { saveSettings, tierName, type GameSettings } from '../ui/SettingsPanel.js';
+import { PauseOverlay } from '../ui/PauseOverlay.js';
 
-const BASE_FOV = 92;
+const DEFAULT_FOV = 92;
+/** Radians of view rotation per pixel of raw mouse movement, at sensitivity 1. */
+const RAD_PER_PX = 0.0022;
+/**
+ * Largest single-event mouse delta we will act on. Real motion never comes
+ * close; a value above this is a pointer-lock warp or a driver hiccup, and
+ * acting on it reads as the view being yanked away.
+ */
+const MAX_MOVE_PX = 900;
 /** The viewmodel renders through a narrower lens than the world, the usual
  * trick for a wide gameplay FOV without a fisheye weapon. */
 const VM_FOV_RATIO = 0.62;
@@ -70,20 +80,13 @@ interface LocalWeapon {
   shots: number;
 }
 
-export interface GameOptions {
-  sensitivity: number;
-  quality: Quality;
-  name: string;
+/** Everything a match needs: the player's settings plus how to host it. */
+export type GameOptions = GameSettings & {
   /** Host the match in this tab instead of connecting to a server. */
   offline?: boolean;
-  /** 0.5..1 — render below native resolution and upscale. */
-  renderScale?: number;
-  /** Let the renderer trade resolution for frame rate automatically. */
-  dynamicResolution?: boolean;
   /** Total participants (including you) when bots fill the match. */
   fillTo?: number;
-  botSkill?: number;
-}
+};
 
 export class Game {
   private readonly render: RenderSystem;
@@ -92,6 +95,8 @@ export class Game {
   private readonly audio = new AudioEngine();
   private readonly hud: Hud;
   private readonly minimap: Minimap;
+  private readonly pause: PauseOverlay;
+  private readonly settings: GameSettings;
   private conn: GameConnection;
   readonly offline: boolean;
   private map: GameMap;
@@ -123,6 +128,15 @@ export class Game {
   private lookDx = 0;
   private lookDy = 0;
   private sensitivity: number;
+  private adsSensitivity = 1;
+  private pitchSign = -1;
+  private mouseSmoothing = 0;
+  private baseFov = DEFAULT_FOV;
+  /** Buffered mouse motion, only used when smoothing is switched on. */
+  private pendingDx = 0;
+  private pendingDy = 0;
+  /** Set when pointer lock is acquired; the first delta after that is a warp. */
+  private skipNextMove = false;
   private chatOpen = false;
   private scoreboardOpen = false;
 
@@ -149,13 +163,17 @@ export class Game {
   constructor(container: HTMLElement, hud: Hud, opts: GameOptions, onDisconnect: (reason: string) => void) {
     this.hud = hud;
     this.sensitivity = opts.sensitivity;
+    this.adsSensitivity = opts.adsSensitivity ?? 1;
+    this.pitchSign = opts.invertY ? 1 : -1;
+    this.mouseSmoothing = opts.mouseSmoothing ?? 0;
+    this.baseFov = opts.fov ?? DEFAULT_FOV;
     this.onDisconnect = onDisconnect;
 
     this.map = getMap('reactor');
     this.world = new CollisionWorld(this.map);
     this.local = createMoveState(0, 1, 0);
 
-    this.render = new RenderSystem(container, BASE_FOV);
+    this.render = new RenderSystem(container, opts.fov ?? DEFAULT_FOV);
     setCharacterQuality(opts.quality);
     this.render.applyMap(this.map, opts.quality);
 
@@ -163,7 +181,7 @@ export class Game {
     const level = buildLevel(this.map, materials);
     this.render.scene.add(level.group);
 
-    this.vm = new ViewModel(BASE_FOV * VM_FOV_RATIO);
+    this.vm = new ViewModel(DEFAULT_FOV * VM_FOV_RATIO);
     this.vm.setEnvironment(this.render.environment);
     this.render.setRenderScale(opts.renderScale ?? 1);
     this.render.setDynamicResolution(opts.dynamicResolution !== false);
@@ -182,11 +200,70 @@ export class Game {
     };
     this.offline = opts.offline === true;
     this.conn = this.offline
-      ? new LocalConnection(handlers, { fillTo: opts.fillTo ?? 6, botSkill: opts.botSkill ?? 0.55 })
+      ? new LocalConnection(handlers, { fillTo: opts.fillTo ?? 5, botTier: tierName(opts.botSkill) })
       : new Connection(handlers);
+
+    this.settings = opts;
+    this.pause = new PauseOverlay(
+      hud.root,
+      this.settings,
+      (next) => this.applyLiveSettings(next),
+      {
+        onResume: () => {
+          this.pause.hide();
+          this.requestLock();
+        },
+        onQuit: () => {
+          this.pause.hide();
+          this.onDisconnect('left the match');
+        },
+      },
+    );
+    this.applyLiveSettings(opts);
 
     this.bindInput();
     window.addEventListener('resize', this.handleResize);
+  }
+
+  /**
+   * Apply the settings that can change without restarting the match. Anything
+   * the server owns (bot fill, bot skill) is deliberately absent.
+   */
+  applyLiveSettings(s: {
+    sensitivity: number;
+    adsSensitivity: number;
+    invertY: boolean;
+    mouseSmoothing: number;
+    fov: number;
+    brightness: number;
+    volume: number;
+    muted: boolean;
+    viewmodelSway: number;
+    viewBob: number;
+    renderScale: number;
+    dynamicResolution: boolean;
+    screenEffects: boolean;
+    crosshairColour: string;
+    crosshairDot: boolean;
+    crosshairDynamic: boolean;
+    minimapMode: number;
+    showFps: boolean;
+  }): void {
+    this.sensitivity = s.sensitivity;
+    this.adsSensitivity = s.adsSensitivity;
+    this.pitchSign = s.invertY ? 1 : -1;
+    this.mouseSmoothing = s.mouseSmoothing;
+    this.baseFov = s.fov;
+    this.render.setBrightness(s.brightness);
+    this.audio.setVolume(s.volume);
+    this.audio.setMuted(s.muted);
+    this.vm.setStyle(s.viewmodelSway, s.viewBob);
+    this.render.setRenderScale(s.renderScale);
+    this.render.setDynamicResolution(s.dynamicResolution);
+    this.render.setScreenEffects(s.screenEffects);
+    this.hud.setCrosshairStyle(s.crosshairColour, s.crosshairDot, s.crosshairDynamic);
+    this.hud.setNetStatVisible(s.showFps);
+    this.minimap.setMode(s.minimapMode);
   }
 
   /** Exposed for the browser console and automated smoke tests. */
@@ -194,8 +271,8 @@ export class Game {
     return { render: this.render, vm: this.vm, local: this.local };
   }
 
-  async connect(room: string, name: string, bots?: number): Promise<void> {
-    await this.conn.connect(room, name, bots);
+  async connect(room: string, name: string, bots?: number, tier?: string): Promise<void> {
+    await this.conn.connect(room, name, bots, tier);
     this.audio.ensure();
   }
 
@@ -221,6 +298,7 @@ export class Game {
     window.removeEventListener('wheel', this.handleWheel);
     window.removeEventListener('contextmenu', preventDefault);
     this.conn.close();
+    this.pause.dispose();
     this.render.renderer.dispose();
     this.render.canvas.remove();
   }
@@ -230,8 +308,8 @@ export class Game {
   private bindInput(): void {
     const canvas = this.render.canvas;
     canvas.addEventListener('click', () => {
-      if (!this.chatOpen && document.pointerLockElement !== canvas) {
-        void canvas.requestPointerLock();
+      if (!this.chatOpen && !this.pause.isOpen && document.pointerLockElement !== canvas) {
+        this.requestLock();
         this.audio.ensure();
       }
     });
@@ -249,12 +327,40 @@ export class Game {
     return document.pointerLockElement === this.render.canvas;
   }
 
+  /**
+   * Ask for raw, unaccelerated deltas. Without this the OS pointer-acceleration
+   * curve is applied first, so a fast flick is silently multiplied two or three
+   * times over — which is exactly what a sudden sensitivity spike feels like.
+   * Not every browser supports it, hence the plain retry.
+   */
+  private requestLock(): void {
+    const canvas = this.render.canvas;
+    const attempt = canvas.requestPointerLock({ unadjustedMovement: true }) as unknown as
+      | Promise<void>
+      | undefined;
+    if (attempt && typeof attempt.catch === 'function') {
+      attempt.catch(() => {
+        try {
+          canvas.requestPointerLock();
+        } catch {
+          /* the user can click again */
+        }
+      });
+    }
+  }
+
   private handlePointerLock = (): void => {
-    this.hud.setPointerHint(!this.locked && !this.chatOpen);
     if (!this.locked) {
       this.keys.clear();
       this.mouseButtons = 0;
+      if (!this.chatOpen) this.pause.show();
+    } else {
+      this.pause.hide();
+      this.skipNextMove = true;
+      this.pendingDx = 0;
+      this.pendingDy = 0;
     }
+    this.hud.setPointerHint(!this.locked && !this.chatOpen && !this.pause.isOpen);
   };
 
   /**
@@ -264,25 +370,63 @@ export class Game {
    */
   private handlePointerMove = (e: PointerEvent): void => {
     if (!this.locked) return;
-    let dx = 0;
-    let dy = 0;
-    const coalesced = typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : null;
-    if (coalesced && coalesced.length > 0) {
-      for (const c of coalesced) {
-        dx += c.movementX;
-        dy += c.movementY;
-      }
-    } else {
-      dx = e.movementX;
-      dy = e.movementY;
+    // Engaging pointer lock warps the cursor, and the first delta afterwards can
+    // be measured from wherever it used to be — a whole screen width at worst.
+    if (this.skipNextMove) {
+      this.skipNextMove = false;
+      return;
     }
-    const s = this.sensitivity * 0.0022;
-    this.yaw -= dx * s;
-    this.pitch -= dy * s;
-    this.pitch = Math.max(-1.5533, Math.min(1.5533, this.pitch));
+
+    let dx = e.movementX;
+    let dy = e.movementY;
+    const coalesced = typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : null;
+    if (coalesced && coalesced.length > 1) {
+      let sx = 0;
+      let sy = 0;
+      for (const c of coalesced) {
+        sx += c.movementX;
+        sy += c.movementY;
+      }
+      // Whether a coalesced sample's movementX is relative to the previous
+      // sample or to the previous dispatched event is implementation-defined.
+      // The parent event's total is the one the spec pins down, so only take the
+      // finer-grained samples when they agree with it.
+      if (Math.abs(sx) <= Math.abs(dx) + 1 && Math.abs(sy) <= Math.abs(dy) + 1) {
+        dx = sx;
+        dy = sy;
+      }
+    }
+    if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
+    dx = Math.max(-MAX_MOVE_PX, Math.min(MAX_MOVE_PX, dx));
+    dy = Math.max(-MAX_MOVE_PX, Math.min(MAX_MOVE_PX, dy));
+
+    // Sway follows the hand, so it uses the raw delta rather than the
+    // zoom-corrected or inverted one.
     this.lookDx += dx * 0.001;
     this.lookDy += dy * 0.001;
+
+    if (this.mouseSmoothing > 0) {
+      this.pendingDx += dx;
+      this.pendingDy += dy;
+      return;
+    }
+    this.applyLook(dx, dy);
   };
+
+  /**
+   * Convert a mouse delta into view angles. Zooming shrinks the angle covered by
+   * the screen, so without this correction aiming down a 22-degree sniper scope
+   * feels four times as sensitive as hip fire.
+   */
+  private applyLook(dx: number, dy: number): void {
+    const baseTan = Math.tan((this.baseFov * Math.PI) / 360);
+    const fovScale = Math.tan((this.render.camera.fov * Math.PI) / 360) / baseTan;
+    const zoomed = fovScale < 0.995;
+    const s = this.sensitivity * RAD_PER_PX * fovScale * (zoomed ? this.adsSensitivity : 1);
+    this.yaw -= dx * s;
+    this.pitch += dy * s * this.pitchSign;
+    this.pitch = Math.max(-1.5533, Math.min(1.5533, this.pitch));
+  }
 
   private handleMouseDown = (e: MouseEvent): void => {
     if (!this.locked) return;
@@ -315,12 +459,15 @@ export class Game {
       return;
     }
     if (e.code === 'KeyM') {
-      this.minimap.cycle();
+      this.settings.minimapMode = this.minimap.cycle();
+      saveSettings(this.settings);
       return;
     }
     if (e.code === 'KeyO') {
-      this.audio.setMuted(!this.audio.isMuted);
-      this.hud.showToast(this.audio.isMuted ? 'Audio muted' : 'Audio on');
+      this.settings.muted = !this.audio.isMuted;
+      this.audio.setMuted(this.settings.muted);
+      saveSettings(this.settings);
+      this.hud.showToast(this.settings.muted ? 'Audio muted' : 'Audio on');
       return;
     }
     const weaponKeys: Record<string, WeaponId> = {
@@ -527,9 +674,12 @@ export class Game {
         }
         case 'spawn': {
           if (ev.id === this.selfId) {
+            const wasDead = this.dead;
             this.local = createMoveState(ev.x, ev.y, ev.z);
-            this.yaw = ev.yaw;
-            this.pitch = 0;
+            if (wasDead) {
+              this.yaw = ev.yaw;
+              this.pitch = 0;
+            }
             this.recoilPitch = 0;
             this.recoilYaw = 0;
             this.pending.length = 0;
@@ -629,6 +779,16 @@ export class Game {
 
   /** One fixed simulation step: sample input, predict, maybe fire. */
   private tickInput(): void {
+    if (this.mouseSmoothing > 0 && (this.pendingDx !== 0 || this.pendingDy !== 0)) {
+      const take = 1 - this.mouseSmoothing;
+      const dx = this.pendingDx * take;
+      const dy = this.pendingDy * take;
+      this.pendingDx -= dx;
+      this.pendingDy -= dy;
+      if (Math.abs(this.pendingDx) < 1e-3) this.pendingDx = 0;
+      if (Math.abs(this.pendingDy) < 1e-3) this.pendingDy = 0;
+      this.applyLook(dx, dy);
+    }
     const buttons = this.gatherButtons();
     const forward = (this.keys.has('KeyW') ? 1 : 0) - (this.keys.has('KeyS') ? 1 : 0);
     const rightRaw = (this.keys.has('KeyD') ? 1 : 0) - (this.keys.has('KeyA') ? 1 : 0);
@@ -740,8 +900,12 @@ export class Game {
     // View kick. Sign alternates so sustained fire drifts rather than climbing
     // in a straight line.
     const kickScale = ads ? 0.72 : 1;
-    this.recoilPitch += w.recoilUp * kickScale;
-    this.pitch += w.recoilUp * kickScale;
+    const before = this.pitch;
+    // Symmetric so a future weapon with downward kick cannot escape the clamp.
+    this.pitch = Math.max(-1.5533, Math.min(1.5533, this.pitch + w.recoilUp * kickScale));
+    // Mirror the clamp into the debt so recovery cannot pay back a kick that was
+    // never applied — that shows up as the view sinking while firing upward.
+    this.recoilPitch += this.pitch - before;
     const side = (rng() - 0.5) * 2 * w.recoilSide * kickScale;
     this.recoilYaw += side;
     this.yaw += side;
@@ -824,7 +988,7 @@ export class Game {
 
     const ads = (this.mouseButtons & 2) !== 0 && !this.dead ? 1 : 0;
     const w = WEAPONS[this.weapon.id];
-    const targetFov = ads ? w.adsFov : BASE_FOV;
+    const targetFov = ads ? w.adsFov : this.baseFov;
     const fov = cam.fov + (targetFov - cam.fov) * Math.min(1, 10 * dt);
     this.render.setFov(fov);
     this.vm.resize(window.innerWidth / window.innerHeight, Math.max(32, fov * VM_FOV_RATIO));

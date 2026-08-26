@@ -13,13 +13,13 @@ app.appendChild(loading);
 const hud = new Hud(app);
 let game: Game | null = null;
 
-const menu = new Menu(app, async ({ room, settings, offline, fillTo }: StartRequest) => {
+const menu = new Menu(app, async ({ room, settings, offline, fillTo, tier }: StartRequest) => {
   loading.classList.remove('hidden');
   // Let the browser paint the loading state before the (synchronous) texture
   // and geometry build blocks the main thread.
   await new Promise((r) => setTimeout(r, 30));
 
-  const g = new Game(app, hud, { ...settings, offline, fillTo, botSkill: settings.botSkill }, (reason) => {
+  const g = new Game(app, hud, { ...settings, offline, fillTo }, (reason) => {
     g.dispose();
     game = null;
     hud.hide();
@@ -27,7 +27,7 @@ const menu = new Menu(app, async ({ room, settings, offline, fillTo }: StartRequ
   });
 
   try {
-    await g.connect(room, settings.name, fillTo);
+    await g.connect(room, settings.name, fillTo, tier);
   } catch (err) {
     g.dispose();
     loading.classList.add('hidden');

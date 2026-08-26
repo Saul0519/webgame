@@ -1,4 +1,4 @@
-import { Btn, TICK_DT } from './constants.js';
+import { Btn } from './constants.js';
 import type { CollisionWorld } from './collision.js';
 import type { NavGraph } from './nav.js';
 import { WEAPONS, WeaponId, fireIntervalMs } from './weapons.js';
@@ -28,25 +28,152 @@ export interface BotSelf {
 
 export interface BotView {
   timeMs: number;
+  /** Seconds since this bot last thought; turn rates are expressed per second. */
+  dtSec: number;
   world: CollisionWorld;
   nav: NavGraph;
   self: BotSelf;
   enemies: BotEnemy[];
 }
 
+export type BotTierName = 'recruit' | 'regular' | 'veteran' | 'elite';
+
+/**
+ * A difficulty tier, spelled out rather than derived from one 0..1 scalar.
+ *
+ * A single scalar could not express "slow AND inaccurate AND unaware", which is
+ * what makes a bot beatable. The knobs that actually decide whether a fight
+ * feels fair are view latency, field of view, the aim cone, how often the aim
+ * error is resampled, and whether re-peeking costs the bot anything — so each
+ * one is an explicit number here.
+ */
+export interface BotTier {
+  name: BotTierName;
+  /** Reaction to a target that was not visible at all, in ms. */
+  reactMs: [number, number];
+  /** Shorter reaction when re-acquiring someone they just lost sight of. */
+  reacquireMs: [number, number];
+  /** Honest radians per second of view rotation. */
+  turnRate: number;
+  /** Half-angle of the aim error cone at point blank, radians. */
+  aimCone: number;
+  /** Vertical error as a fraction of the horizontal cone. */
+  aimPitchScale: number;
+  /** How often the aim error is redrawn. Shorter than a burst, or bursts become all-or-nothing. */
+  aimResampleMs: [number, number];
+  /** Bots hold fire until pointed this close to the TRUE target direction. */
+  fireGate: number;
+  burst: [number, number];
+  burstRestMs: [number, number];
+  /** Vision cone half-angle in radians. Enemies outside it are not seen. */
+  fovHalf: number;
+  /** Metres. Beyond this a bot simply does not notice anyone. */
+  sightRange: number;
+  /** Bots aim at where you were this many ms ago, like a player watching snapshots. */
+  viewLatencyMs: number;
+  /** Fraction of shots deliberately thrown away. */
+  shotDrop: number;
+  /** Only aim down sights beyond this range; Infinity means never. */
+  adsRange: number;
+}
+
+export const BOT_TIERS: Record<BotTierName, BotTier> = {
+  recruit: {
+    name: 'recruit',
+    reactMs: [620, 820],
+    reacquireMs: [400, 520],
+    turnRate: 2.1,
+    aimCone: 0.09,
+    aimPitchScale: 0.6,
+    aimResampleMs: [90, 150],
+    fireGate: 0.02,
+    burst: [2, 3],
+    burstRestMs: [700, 950],
+    fovHalf: (50 * Math.PI) / 180,
+    sightRange: 28,
+    viewLatencyMs: 220,
+    shotDrop: 0.35,
+    adsRange: Infinity,
+  },
+  regular: {
+    name: 'regular',
+    reactMs: [380, 520],
+    reacquireMs: [240, 340],
+    turnRate: 3.2,
+    aimCone: 0.055,
+    aimPitchScale: 0.6,
+    aimResampleMs: [80, 140],
+    fireGate: 0.016,
+    burst: [3, 4],
+    burstRestMs: [480, 700],
+    fovHalf: (65 * Math.PI) / 180,
+    sightRange: 40,
+    viewLatencyMs: 150,
+    shotDrop: 0.15,
+    adsRange: 22,
+  },
+  veteran: {
+    name: 'veteran',
+    reactMs: [240, 340],
+    reacquireMs: [150, 220],
+    turnRate: 4.6,
+    aimCone: 0.032,
+    aimPitchScale: 0.6,
+    aimResampleMs: [70, 120],
+    fireGate: 0.012,
+    burst: [4, 6],
+    burstRestMs: [320, 480],
+    fovHalf: (85 * Math.PI) / 180,
+    sightRange: 60,
+    viewLatencyMs: 90,
+    shotDrop: 0.05,
+    adsRange: 18,
+  },
+  elite: {
+    name: 'elite',
+    reactMs: [140, 220],
+    reacquireMs: [90, 140],
+    turnRate: 6.5,
+    aimCone: 0.018,
+    aimPitchScale: 0.6,
+    aimResampleMs: [60, 100],
+    fireGate: 0.009,
+    burst: [5, 8],
+    burstRestMs: [200, 320],
+    fovHalf: (110 * Math.PI) / 180,
+    sightRange: 90,
+    viewLatencyMs: 45,
+    shotDrop: 0,
+    adsRange: 14,
+  },
+};
+
+export function tierByName(name: string | undefined): BotTier {
+  const t = BOT_TIERS[(name ?? '') as BotTierName];
+  return t ?? BOT_TIERS.regular;
+}
+
+/** How stale a last-known position can get before a bot gives up on it. */
+const LAST_SEEN_TIMEOUT_MS = 4000;
+/** Aim error grows with distance so long shots are genuinely hard. */
+const RANGE_SPREAD_REF = 25;
+
 export interface BotBrain {
   name: string;
-  /** 0 = harmless, 1 = ruthless. Drives aim speed, accuracy and reaction time. */
-  skill: number;
+  tier: BotTier;
+  /** Per-bot variation so a lobby is not four identical opponents. */
+  coneScale: number;
+  reactScale: number;
   yaw: number;
   pitch: number;
   targetId: number;
   retargetAt: number;
-  /** Time at which the bot is allowed to start shooting at the current target. */
   reactAt: number;
+  wasVisible: boolean;
   lastSeenX: number;
   lastSeenY: number;
   lastSeenZ: number;
+  lastSeenAt: number;
   hasLastSeen: boolean;
   path: number[];
   pathIdx: number;
@@ -76,18 +203,24 @@ export function botName(i: number): string {
   return i < BOT_NAMES.length ? base : `${base}-${Math.floor(i / BOT_NAMES.length) + 1}`;
 }
 
-export function createBrain(name: string, skill: number, yaw: number): BotBrain {
+export function createBrain(name: string, tier: BotTier, yaw: number, rand: () => number): BotBrain {
   return {
     name,
-    skill,
+    tier,
+    // Vary only the two knobs a player can feel, and only a little; varying the
+    // whole tier is what made a difficulty setting stop meaning anything.
+    coneScale: 1 + (rand() - 0.5) * 0.24,
+    reactScale: 1 + (rand() - 0.5) * 0.24,
     yaw,
     pitch: 0,
     targetId: 0,
     retargetAt: 0,
     reactAt: 0,
+    wasVisible: false,
     lastSeenX: 0,
     lastSeenY: 0,
     lastSeenZ: 0,
+    lastSeenAt: -1e9,
     hasLastSeen: false,
     path: [],
     pathIdx: 0,
@@ -115,8 +248,12 @@ function shortestAngle(from: number, to: number): number {
   return d;
 }
 
-/** True if the bot's eyes can see the given point. */
-function canSee(view: BotView, tx: number, ty: number, tz: number): boolean {
+function pick(range: [number, number], rand: () => number): number {
+  return range[0] + rand() * (range[1] - range[0]);
+}
+
+/** Line of sight only — the facing test is applied by the caller. */
+function hasLos(view: BotView, tx: number, ty: number, tz: number): boolean {
   const ox = view.self.x;
   const oy = view.self.y + view.self.eye;
   const oz = view.self.z;
@@ -125,18 +262,33 @@ function canSee(view: BotView, tx: number, ty: number, tz: number): boolean {
   const dz = tz - oz;
   const dist = Math.hypot(dx, dy, dz);
   if (dist < 0.001) return true;
-  const hit = view.world.raycast(ox, oy, oz, dx / dist, dy / dist, dz / dist, dist - 0.15);
-  return hit === null;
+  return view.world.raycast(ox, oy, oz, dx / dist, dy / dist, dz / dist, dist - 0.15) === null;
+}
+
+/** True when the enemy is in front of the bot, within range, and not behind cover. */
+function canSee(b: BotBrain, view: BotView, e: BotEnemy): boolean {
+  const dx = e.x - view.self.x;
+  const dz = e.z - view.self.z;
+  const horiz = Math.hypot(dx, dz);
+  if (horiz > b.tier.sightRange) return false;
+  if (horiz > 0.001) {
+    // Bots used to have no facing test at all, so nobody could ever flank one.
+    const fwdDot = (-Math.sin(b.yaw) * dx + -Math.cos(b.yaw) * dz) / horiz;
+    if (fwdDot < Math.cos(b.tier.fovHalf)) return false;
+  }
+  return hasLos(view, e.x, e.y + 1.1, e.z);
 }
 
 /**
- * Produce one tick of input for a bot. Deliberately plays like a person with a
- * mouse: it turns at a finite rate, has a reaction delay, sprays a little, and
- * fires in bursts rather than holding the trigger forever.
+ * Produce one tick of input for a bot. Deliberately plays like a person: it
+ * turns at a finite rate, only knows where you were a moment ago, cannot see
+ * behind itself, loses track of you behind cover, and pays a reaction cost
+ * every time you reappear.
  */
 export function botThink(b: BotBrain, view: BotView, rand: () => number, seq: number): WireInput {
   const now = view.timeMs;
   const self = view.self;
+  const tier = b.tier;
   const weapon = WEAPONS[self.weapon];
   let buttons = 0;
 
@@ -152,60 +304,77 @@ export function botThink(b: BotBrain, view: BotView, rand: () => number, seq: nu
     for (const e of view.enemies) {
       if (!e.alive) continue;
       const d = Math.hypot(e.x - self.x, e.y - self.y, e.z - self.z);
-      const visible = canSee(view, e.x, e.y + 1.1, e.z);
-      const score = (visible ? 900 : 0) - d;
+      // Someone they can actually see beats someone they merely heard about.
+      const score = canSee(b, view, e) ? 900 - d : -d * 4;
       if (score > bestScore) {
         bestScore = score;
         best = e;
       }
     }
+    target = best;
     if (best && best.id !== b.targetId) {
       b.targetId = best.id;
-      // Reaction time: better bots swing on faster.
-      b.reactAt = now + 260 - b.skill * 170 + rand() * 120;
+      b.wasVisible = false;
       b.hasLastSeen = false;
     }
-    target = best;
   }
 
-  const visible = target ? canSee(view, target.x, target.y + 1.1, target.z) : false;
+  const visible = target ? canSee(b, view, target) : false;
+
+  // Reaction is charged on every visibility transition, not just when the target
+  // id changes — otherwise re-peeking the same bot is free and it pre-fires.
+  if (visible && !b.wasVisible) {
+    const range = b.hasLastSeen && now - b.lastSeenAt < 2500 ? tier.reacquireMs : tier.reactMs;
+    b.reactAt = now + pick(range, rand) * b.reactScale;
+  }
+  b.wasVisible = visible;
+
   if (target && visible) {
     b.lastSeenX = target.x;
     b.lastSeenY = target.y;
     b.lastSeenZ = target.z;
+    b.lastSeenAt = now;
     b.hasLastSeen = true;
+  } else if (b.hasLastSeen && now - b.lastSeenAt > LAST_SEEN_TIMEOUT_MS) {
+    b.hasLastSeen = false;
+    b.targetId = 0;
   }
 
   // --- Aim ------------------------------------------------------------------
-  let desiredYaw = b.yaw;
-  let desiredPitch = b.pitch;
   let aimError = Math.PI;
-  const aimAt = target && visible ? target : b.hasLastSeen ? null : null;
-  const ax = aimAt ? aimAt.x : b.lastSeenX;
-  const ay = (aimAt ? aimAt.y : b.lastSeenY) + 1.15;
-  const az = aimAt ? aimAt.z : b.lastSeenZ;
+  const aimKnown = (target !== null && visible) || b.hasLastSeen;
+  const ax = target && visible ? target.x : b.lastSeenX;
+  const ay = (target && visible ? target.y : b.lastSeenY) + 1.15;
+  const az = target && visible ? target.z : b.lastSeenZ;
 
-  if (aimAt || b.hasLastSeen) {
-    // Slowly drifting aim error, so bots miss like people rather than jittering.
-    if (now >= b.aimErrAt) {
-      b.aimErrAt = now + 220 + rand() * 260;
-      const spread = (1 - b.skill) * 0.075 + 0.008;
-      b.aimErrX = (rand() - 0.5) * 2 * spread;
-      b.aimErrY = (rand() - 0.5) * 2 * spread * 0.6;
-    }
+  if (aimKnown) {
     const dx = ax - self.x;
     const dy = ay - (self.y + self.eye);
     const dz = az - self.z;
     const horiz = Math.hypot(dx, dz) || 0.001;
-    desiredYaw = Math.atan2(-dx, -dz) + b.aimErrX;
-    desiredPitch = Math.atan2(dy, horiz) + b.aimErrY;
+    const range = Math.hypot(dx, dy, dz);
 
-    const turnRate = (3.4 + b.skill * 7.5) * TICK_DT;
-    const dYaw = shortestAngle(b.yaw, desiredYaw);
-    const dPitch = desiredPitch - b.pitch;
-    b.yaw += Math.max(-turnRate, Math.min(turnRate, dYaw));
-    b.pitch += Math.max(-turnRate, Math.min(turnRate, dPitch));
-    aimError = Math.hypot(shortestAngle(b.yaw, desiredYaw), desiredPitch - b.pitch);
+    // Resampled several times per burst, so a burst walks across the target
+    // instead of committing to one offset and either shredding or whiffing.
+    if (now >= b.aimErrAt) {
+      b.aimErrAt = now + pick(tier.aimResampleMs, rand);
+      const cone = tier.aimCone * b.coneScale * (1 + Math.min(1.5, range / RANGE_SPREAD_REF));
+      b.aimErrX = (rand() - 0.5) * 2 * cone;
+      b.aimErrY = (rand() - 0.5) * 2 * cone * tier.aimPitchScale;
+    }
+
+    const trueYaw = Math.atan2(-dx, -dz);
+    const truePitch = Math.atan2(dy, horiz);
+    const desiredYaw = trueYaw + b.aimErrX;
+    const desiredPitch = truePitch + b.aimErrY;
+
+    const step = tier.turnRate * view.dtSec;
+    b.yaw += Math.max(-step, Math.min(step, shortestAngle(b.yaw, desiredYaw)));
+    b.pitch += Math.max(-step, Math.min(step, desiredPitch - b.pitch));
+
+    // Gate against the TRUE direction. Gating against the offset aim point made
+    // the threshold decorative: it always converged, so it never held fire.
+    aimError = Math.hypot(shortestAngle(b.yaw, trueYaw), truePitch - b.pitch);
   }
   b.pitch = Math.max(-1.2, Math.min(1.2, b.pitch));
 
@@ -217,24 +386,25 @@ export function botThink(b: BotBrain, view: BotView, rand: () => number, seq: nu
     now >= b.reactAt &&
     !self.reloading &&
     self.ammo > 0 &&
-    aimError < 0.06 + (1 - b.skill) * 0.05 &&
-    range < weapon.falloffEnd * 1.1;
+    aimError < tier.fireGate &&
+    range < Math.min(weapon.falloffEnd * 1.1, tier.sightRange);
 
   if (wantShoot) {
     if (now >= b.burstRestUntil) {
       if (now >= b.burstUntil) {
-        const shots = weapon.pellets > 1 ? 1 : 3 + Math.floor(rand() * 4);
+        const shots = weapon.pellets > 1 ? 1 : Math.round(pick(tier.burst, rand));
         b.burstUntil = now + shots * fireIntervalMs(weapon);
         b.burstRestUntil = 0;
       }
       if (now < b.burstUntil) {
-        buttons |= Btn.Fire;
+        // A deliberate miss rate; without it low tiers still delete you the
+        // moment their cone happens to settle on your chest.
+        if (rand() >= tier.shotDrop) buttons |= Btn.Fire;
       } else {
-        b.burstRestUntil = now + 140 + (1 - b.skill) * 320 + rand() * 160;
+        b.burstRestUntil = now + pick(tier.burstRestMs, rand);
       }
     }
-    // Aim down sights at range for the tighter cone.
-    if (range > 16 && weapon.spreadAds < weapon.spreadHip) buttons |= Btn.Ads;
+    if (range > tier.adsRange && weapon.spreadAds < weapon.spreadHip) buttons |= Btn.Ads;
   } else {
     b.burstUntil = 0;
   }
@@ -249,7 +419,6 @@ export function botThink(b: BotBrain, view: BotView, rand: () => number, seq: nu
   let moveYaw = b.yaw;
 
   if (target && visible && range < 26) {
-    // In a fight: keep the preferred range and strafe across the target.
     if (now >= b.strafeUntil) {
       b.strafeUntil = now + 600 + rand() * 900;
       b.strafe = rand() < 0.5 ? -1 : 1;
@@ -258,15 +427,17 @@ export function botThink(b: BotBrain, view: BotView, rand: () => number, seq: nu
     forward = range > ideal + 3 ? 1 : range < ideal - 3 ? -1 : 0;
     right = b.strafe;
     b.path.length = 0;
-    if (now >= b.jumpAt && rand() < 0.02 * (0.4 + b.skill)) {
+    if (now >= b.jumpAt && rand() < 0.02) {
       buttons |= Btn.Jump;
       b.jumpAt = now + 900;
     }
   } else {
-    // Otherwise navigate: toward the target's last known spot, else patrol.
-    const goalX = target ? target.x : b.hasLastSeen ? b.lastSeenX : NaN;
-    const goalZ = target ? target.z : b.hasLastSeen ? b.lastSeenZ : NaN;
-    const goalY = target ? target.y : b.lastSeenY;
+    // Head for where the enemy was last SEEN. Navigating to their live position
+    // while they are behind a wall is wallhack pathing: disengaging never works.
+    const useLastSeen = b.hasLastSeen;
+    const goalX = useLastSeen ? b.lastSeenX : NaN;
+    const goalY = useLastSeen ? b.lastSeenY : 0;
+    const goalZ = useLastSeen ? b.lastSeenZ : NaN;
 
     if (now >= b.repathAt || b.path.length === 0 || b.pathIdx >= b.path.length) {
       b.repathAt = now + 700 + rand() * 500;
@@ -285,7 +456,6 @@ export function botThink(b: BotBrain, view: BotView, rand: () => number, seq: nu
     }
 
     if (b.path.length > 0) {
-      // Skip waypoints we have already reached.
       while (b.pathIdx < b.path.length) {
         const n = view.nav.nodes[b.path[b.pathIdx]];
         if (Math.hypot(n.x - self.x, n.z - self.z) < 1.6 && Math.abs(n.y - self.y) < 2.5) b.pathIdx++;
@@ -326,8 +496,8 @@ export function botThink(b: BotBrain, view: BotView, rand: () => number, seq: nu
   // the path. Either way the reported yaw is the smoothed one, so movement axes
   // and the visible aim direction always agree.
   if (!(target && visible)) {
-    b.yaw += shortestAngle(b.yaw, moveYaw) * Math.min(1, 9 * TICK_DT);
-    b.pitch += (0 - b.pitch) * Math.min(1, 4 * TICK_DT);
+    b.yaw += shortestAngle(b.yaw, moveYaw) * Math.min(1, 9 * view.dtSec);
+    b.pitch += (0 - b.pitch) * Math.min(1, 4 * view.dtSec);
   }
 
   return {

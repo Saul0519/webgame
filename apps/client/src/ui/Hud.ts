@@ -49,6 +49,10 @@ export class Hud {
   private hurtT = 0;
   private toastT = 0;
   private names = new Map<number, string>();
+  private crosshairColour = '#e2f4ff';
+  private crosshairDot = true;
+  private crosshairDynamic = true;
+  private netStatVisible = true;
   private selfId = 0;
 
   constructor(parent: HTMLElement) {
@@ -119,6 +123,21 @@ export class Hud {
     this.pointerHint = q('.pointerhint');
   }
 
+  setCrosshairStyle(colour: string, dot: boolean, dynamic: boolean): void {
+    this.crosshairColour = colour;
+    this.crosshairDot = dot;
+    this.crosshairDynamic = dynamic;
+  }
+
+  setNetStatVisible(visible: boolean): void {
+    this.netStatVisible = visible;
+    this.netstat.style.display = visible ? '' : 'none';
+  }
+
+  get netStatShown(): boolean {
+    return this.netStatVisible;
+  }
+
   setSelf(id: number): void {
     this.selfId = id;
   }
@@ -177,29 +196,32 @@ export class Hud {
     const cx = n / 2;
     const cy = n / 2;
     const alpha = 1 - ads * 0.85;
+    const rgb = hexToRgb(this.crosshairColour);
     if (alpha <= 0.02) {
       // Fully aimed: a single dot keeps the sight picture clean.
-      c.fillStyle = 'rgba(255,80,80,0.9)';
+      c.fillStyle = `rgba(${rgb},0.9)`;
       c.beginPath();
       c.arc(cx, cy, 1.6, 0, Math.PI * 2);
       c.fill();
       return;
     }
 
-    const gap = 4 + spreadPx;
+    const gap = 4 + (this.crosshairDynamic ? spreadPx : 0);
     const len = 7;
     c.lineCap = 'round';
     c.strokeStyle = `rgba(0,0,0,${0.55 * alpha})`;
     c.lineWidth = 3.4;
     strokeArms(c, cx, cy, gap, len);
-    c.strokeStyle = hitFade > 0 ? `rgba(255,120,120,${alpha})` : `rgba(226,244,255,${0.92 * alpha})`;
+    c.strokeStyle = hitFade > 0 ? `rgba(255,120,120,${alpha})` : `rgba(${rgb},${0.92 * alpha})`;
     c.lineWidth = 1.6;
     strokeArms(c, cx, cy, gap, len);
 
-    c.fillStyle = `rgba(226,244,255,${0.9 * alpha})`;
-    c.beginPath();
-    c.arc(cx, cy, 1.1, 0, Math.PI * 2);
-    c.fill();
+    if (this.crosshairDot) {
+      c.fillStyle = `rgba(${rgb},${0.9 * alpha})`;
+      c.beginPath();
+      c.arc(cx, cy, 1.1, 0, Math.PI * 2);
+      c.fill();
+    }
   }
 
   flashHit(headshot: boolean): void {
@@ -348,6 +370,13 @@ export class Hud {
   get hitFade(): number {
     return this.hitT;
   }
+}
+
+function hexToRgb(hex: string): string {
+  const m = /^#([0-9a-f]{6})$/i.exec(hex);
+  if (!m) return '226,244,255';
+  const v = parseInt(m[1], 16);
+  return `${(v >> 16) & 255},${(v >> 8) & 255},${v & 255}`;
 }
 
 function strokeArms(c: CanvasRenderingContext2D, cx: number, cy: number, gap: number, len: number): void {

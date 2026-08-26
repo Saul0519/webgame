@@ -32,7 +32,18 @@ import {
   type WireInput,
 } from './protocol.js';
 import { WEAPONS, WeaponId, damageAtRange, fireIntervalMs } from './weapons.js';
-import { botName, botThink, createBrain, type BotBrain, type BotEnemy, type BotSelf, type BotView } from './bot.js';
+import {
+  botName,
+  botThink,
+  createBrain,
+  tierByName,
+  type BotBrain,
+  type BotEnemy,
+  type BotSelf,
+  type BotTier,
+  type BotTierName,
+  type BotView,
+} from './bot.js';
 
 export const KILL_LIMIT = 30;
 export const MATCH_TIME_MS = 10 * 60 * 1000;
@@ -57,8 +68,8 @@ export interface RoomOptions {
   maxPlayers?: number;
   /** Fill the match with bots up to this many total participants. */
   fillTo?: number;
-  /** 0..1 baseline bot skill; each bot varies a little around it. */
-  botSkill?: number;
+  /** Difficulty tier for the bots in this room. */
+  botTier?: BotTierName;
   seed?: number;
 }
 
@@ -122,7 +133,7 @@ export class MatchRoom {
   private readonly players = new Map<number, RoomPlayer>();
   private readonly maxPlayers: number;
   private fillTo: number;
-  private readonly botSkill: number;
+  private botTier: BotTier;
 
   private tickNo = 0;
   private timeMs = 0;
@@ -149,9 +160,16 @@ export class MatchRoom {
     this.nav = new NavGraph(this.world, this.map);
     this.maxPlayers = opts.maxPlayers ?? MAX_PLAYERS_PER_ROOM;
     this.fillTo = Math.min(opts.fillTo ?? 0, this.maxPlayers);
-    this.botSkill = opts.botSkill ?? 0.55;
+    this.botTier = tierByName(opts.botTier ?? 'regular');
     this.rngState = (opts.seed ?? 0x9e3779b9) >>> 0;
-    this.botView = { timeMs: 0, world: this.world, nav: this.nav, self: this.botSelf, enemies: this.botEnemies };
+    this.botView = {
+      timeMs: 0,
+      dtSec: (TICK_MS * BOT_THINK_EVERY) / 1000,
+      world: this.world,
+      nav: this.nav,
+      self: this.botSelf,
+      enemies: this.botEnemies,
+    };
   }
 
   private rand(): number {
@@ -190,6 +208,15 @@ export class MatchRoom {
     this.syncBots();
   }
 
+  /** Difficulty for bots spawned from now on. Existing bots keep theirs. */
+  setBotTier(name: BotTierName | undefined): void {
+    this.botTier = tierByName(name);
+  }
+
+  get botTierName(): BotTierName {
+    return this.botTier.name;
+  }
+
   get botCount(): number {
     return this.players.size - this.humanCount;
   }
@@ -205,6 +232,7 @@ export class MatchRoom {
       maxPlayers: this.maxPlayers,
       map: this.map.id,
       mapName: this.map.name,
+      botTier: this.botTier.name,
       inProgress: this.humanCount > 0,
     };
   }
@@ -284,8 +312,7 @@ export class MatchRoom {
 
     for (let i = bots.length; i < target; i++) {
       const name = botName(this.botsSpawned++);
-      const skill = Math.max(0.1, Math.min(1, this.botSkill + (this.rand() - 0.5) * 0.35));
-      const brain = createBrain(name, skill, 0);
+      const brain = createBrain(name, this.botTier, 0, () => this.rand());
       const p = this.spawnParticipant(name, null, brain);
       p.weapon = [WeaponId.Rifle, WeaponId.Rifle, WeaponId.SMG, WeaponId.Shotgun, WeaponId.Sniper][
         Math.floor(this.rand() * 5)
@@ -488,9 +515,14 @@ export class MatchRoom {
     }
 
     this.botEnemies.length = 0;
+    // Humans render remote players INTERP_DELAY_MS in the past on top of their
+    // own ping. Sampling live positions here would hand bots an information
+    // advantage no player can ever have, so they get a delayed view too.
+    const seenAt = this.timeMs - brain.tier.viewLatencyMs;
     for (const o of this.players.values()) {
       if (o.id === p.id) continue;
-      this.botEnemies.push({ id: o.id, x: o.move.x, y: o.move.y, z: o.move.z, alive: o.alive });
+      const h = sampleHistory(o, seenAt);
+      this.botEnemies.push({ id: o.id, x: h.x, y: h.y, z: h.z, alive: o.alive });
     }
     this.botSelf.x = p.move.x;
     this.botSelf.y = p.move.y;
@@ -741,6 +773,7 @@ export class MatchRoom {
     if (victim.brain) {
       victim.brain.targetId = 0;
       victim.brain.hasLastSeen = false;
+      victim.brain.wasVisible = false;
       victim.brain.path.length = 0;
     }
 

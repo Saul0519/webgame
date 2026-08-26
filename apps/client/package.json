@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:standalone": "vite build --config vite.standalone.config.ts"
   },
   "dependencies": {
     "@webgame/shared": "workspace:*",

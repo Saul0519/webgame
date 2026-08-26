@@ -137,6 +137,11 @@ export class Game {
   private pendingDy = 0;
   /** Set when pointer lock is acquired; the first delta after that is a warp. */
   private skipNextMove = false;
+  /** Set when the browser refuses pointer lock (sandboxed frames, some mobiles). */
+  private lockUnavailable = false;
+  /** In the fallback path the player has clicked in and wants to aim. */
+  private fallbackAiming = false;
+  private hovering = false;
   private chatOpen = false;
   private scoreboardOpen = false;
 
@@ -308,10 +313,19 @@ export class Game {
   private bindInput(): void {
     const canvas = this.render.canvas;
     canvas.addEventListener('click', () => {
-      if (!this.chatOpen && !this.pause.isOpen && document.pointerLockElement !== canvas) {
-        this.requestLock();
-        this.audio.ensure();
+      if (this.chatOpen || this.pause.isOpen) return;
+      this.audio.ensure();
+      if (this.lockUnavailable) {
+        this.fallbackAiming = true;
+        return;
       }
+      if (document.pointerLockElement !== canvas) this.requestLock();
+    });
+    canvas.addEventListener('pointerenter', () => {
+      this.hovering = true;
+    });
+    canvas.addEventListener('pointerleave', () => {
+      this.hovering = false;
     });
     document.addEventListener('pointerlockchange', this.handlePointerLock);
     document.addEventListener('pointermove', this.handlePointerMove);
@@ -335,21 +349,50 @@ export class Game {
    */
   private requestLock(): void {
     const canvas = this.render.canvas;
-    const attempt = canvas.requestPointerLock({ unadjustedMovement: true }) as unknown as
-      | Promise<void>
-      | undefined;
+    let attempt: Promise<void> | undefined;
+    try {
+      attempt = canvas.requestPointerLock({ unadjustedMovement: true }) as unknown as Promise<void> | undefined;
+    } catch {
+      attempt = undefined;
+    }
     if (attempt && typeof attempt.catch === 'function') {
       attempt.catch(() => {
         try {
-          canvas.requestPointerLock();
+          const retry = canvas.requestPointerLock() as unknown as Promise<void> | undefined;
+          if (retry && typeof retry.catch === 'function') retry.catch(() => this.onLockUnavailable());
         } catch {
-          /* the user can click again */
+          this.onLockUnavailable();
         }
       });
     }
+    // Some embedders neither resolve nor reject; if lock has not engaged shortly
+    // after the click, assume it is not coming and fall back.
+    window.setTimeout(() => {
+      if (!this.locked && !this.disposed) this.onLockUnavailable();
+    }, 700);
+  }
+
+  /**
+   * Sandboxed frames can refuse pointer lock outright. Rather than leave the
+   * game unplayable, aim from raw cursor motion while the pointer is over the
+   * view — it is worse than a locked pointer, but it works.
+   */
+  private onLockUnavailable(): void {
+    if (this.lockUnavailable) return;
+    this.lockUnavailable = true;
+    this.fallbackAiming = true;
+    this.pause.hide();
+    this.hud.setPointerHint(false);
+    this.hud.showToast('Mouse lock blocked — open in a tab for full aim');
+  }
+
+  /** True when the game should be reading mouse and keyboard input. */
+  private get inputActive(): boolean {
+    return this.locked || (this.lockUnavailable && this.fallbackAiming && this.hovering);
   }
 
   private handlePointerLock = (): void => {
+    if (this.lockUnavailable) return;
     if (!this.locked) {
       this.keys.clear();
       this.mouseButtons = 0;
@@ -369,7 +412,7 @@ export class Game {
    * so pull the sub-frame history back out where the browser offers it.
    */
   private handlePointerMove = (e: PointerEvent): void => {
-    if (!this.locked) return;
+    if (!this.inputActive) return;
     // Engaging pointer lock warps the cursor, and the first delta afterwards can
     // be measured from wherever it used to be — a whole screen width at worst.
     if (this.skipNextMove) {
@@ -429,7 +472,7 @@ export class Game {
   }
 
   private handleMouseDown = (e: MouseEvent): void => {
-    if (!this.locked) return;
+    if (!this.inputActive) return;
     this.mouseButtons |= 1 << e.button;
   };
 
@@ -438,7 +481,7 @@ export class Game {
   };
 
   private handleWheel = (e: WheelEvent): void => {
-    if (!this.locked) return;
+    if (!this.inputActive) return;
     const order = [WeaponId.Rifle, WeaponId.SMG, WeaponId.Shotgun, WeaponId.Sniper];
     const i = order.indexOf(this.weapon.id);
     const next = order[(i + (e.deltaY > 0 ? 1 : order.length - 1)) % order.length];
@@ -456,6 +499,17 @@ export class Game {
       e.preventDefault();
       this.scoreboardOpen = true;
       this.hud.toggleScoreboard(true);
+      return;
+    }
+    if (e.code === 'Escape' && this.lockUnavailable) {
+      e.preventDefault();
+      if (this.pause.isOpen) {
+        this.pause.hide();
+        this.fallbackAiming = true;
+      } else {
+        this.fallbackAiming = false;
+        this.pause.show();
+      }
       return;
     }
     if (e.code === 'KeyM') {

@@ -90,6 +90,19 @@ pnpm dev:client        # http://127.0.0.1:5173
 pnpm smoke     # 이동 / 사격 / 히트 판정 / 스냅샷 흐름을 실제 소켓으로 확인
 ```
 
+## 단독 실행 파일 (서버 없이)
+
+```bash
+pnpm build:standalone   # apps/client/dist-standalone/reactor.html (약 730KB)
+```
+
+외부 요청이 폰트 하나뿐인 자기완결 HTML 한 장입니다. 열면 바로 봇전이 돌아가는데,
+데모용 가짜가 아니라 브라우저 탭 안에서 **Durable Object가 돌리는 것과 같은 MatchRoom**을
+호스팅합니다 — 예측·재조정·지연 보상까지 동일합니다. 온라인 대전만 빠집니다.
+
+포인터 락이 막힌 임베드 환경(샌드박스 iframe 등)에서는 커서가 화면 위에 있을 때
+상대 이동량으로 조준하는 방식으로 자동 폴백합니다.
+
 ## 배포 (지금 바로 멀티하려면)
 
 Worker 하나가 정적 파일과 게임 서버를 모두 담당합니다(`wrangler.jsonc` 의 `assets` 바인딩).

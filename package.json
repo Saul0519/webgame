@@ -11,7 +11,8 @@
     "build": "pnpm --filter @webgame/shared build && pnpm --filter @webgame/client build",
     "typecheck": "pnpm -r typecheck",
     "deploy": "pnpm build && pnpm --filter @webgame/server deploy",
-    "smoke": "node tools/smoke-test.mjs"
+    "smoke": "node tools/smoke-test.mjs",
+    "build:standalone": "pnpm --filter @webgame/client build:standalone && node tools/build-standalone.mjs"
   },
   "devDependencies": {
     "typescript": "^5.9.3"

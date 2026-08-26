@@ -46,6 +46,35 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
+interface RoomSummary {
+  code: string;
+  players: number;
+  bots: number;
+  maxPlayers: number;
+  mapName: string;
+}
+
+async function publicRoomInfo(env: Env): Promise<RoomSummary[]> {
+  return Promise.all(
+    PUBLIC_ROOMS.map(async (code) => {
+      try {
+        const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(code));
+        const res = await stub.fetch(new Request('https://room/info'));
+        const info = (await res.json()) as Partial<RoomSummary>;
+        return {
+          code,
+          players: info.players ?? 0,
+          bots: info.bots ?? 0,
+          maxPlayers: info.maxPlayers ?? MAX_PLAYERS_PER_ROOM,
+          mapName: info.mapName ?? 'Reactor',
+        };
+      } catch {
+        return { code, players: 0, bots: 0, maxPlayers: MAX_PLAYERS_PER_ROOM, mapName: 'Reactor' };
+      }
+    }),
+  );
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -83,19 +112,13 @@ export default {
       return json({ code, ...info });
     }
 
+    // Server browser: what is running right now, refreshed by the menu.
+    if (url.pathname === '/api/rooms') {
+      return json({ rooms: await publicRoomInfo(env) });
+    }
+
     if (url.pathname === '/api/quickmatch') {
-      const infos = await Promise.all(
-        PUBLIC_ROOMS.map(async (code) => {
-          try {
-            const stub = env.GAME_ROOM.get(env.GAME_ROOM.idFromName(code));
-            const res = await stub.fetch(new Request('https://room/info'));
-            const info = (await res.json()) as { players?: number; maxPlayers?: number };
-            return { code, players: info.players ?? 0, maxPlayers: info.maxPlayers ?? MAX_PLAYERS_PER_ROOM };
-          } catch {
-            return { code, players: 0, maxPlayers: MAX_PLAYERS_PER_ROOM };
-          }
-        }),
-      );
+      const infos = await publicRoomInfo(env);
       const open = infos.filter((i) => i.players < i.maxPlayers);
       // Prefer a room that already has people in it, fullest first.
       const busiest = open.filter((i) => i.players > 0).sort((a, b) => b.players - a.players)[0];

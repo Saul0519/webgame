@@ -11,13 +11,22 @@ const shared = {
   geo: null as Record<string, THREE.BufferGeometry> | null,
 };
 
+let lowSpec = false;
+
+/** Call before any character is built; swaps in cheaper shading on weak GPUs. */
+export function setCharacterQuality(quality: 'low' | 'medium' | 'high'): void {
+  lowSpec = quality === 'low';
+}
+
 function ensureShared(): void {
   if (shared.body) return;
-  shared.body = new THREE.MeshStandardMaterial({
-    color: 0x4a5361,
-    roughness: 0.58,
-    metalness: 0.25,
-  });
+  shared.body = lowSpec
+    ? (new THREE.MeshLambertMaterial({ color: 0x4a5361 }) as unknown as THREE.MeshStandardMaterial)
+    : new THREE.MeshStandardMaterial({
+        color: 0x4a5361,
+        roughness: 0.58,
+        metalness: 0.25,
+      });
   shared.trim = new THREE.MeshStandardMaterial({
     color: 0x232a34,
     roughness: 0.42,
@@ -195,7 +204,7 @@ export class CharacterModel {
     if (delta < -Math.PI) delta += Math.PI * 2;
     const turnRate = s.speed > 0.5 ? 10 : 3.2;
     this.bodyYaw += delta * Math.min(1, turnRate * dt);
-    this.root.rotation.y = this.bodyYaw;
+    this.root.rotation.y = this.bodyYaw + Math.PI;
     this.torso.rotation.y = delta * 0.55;
     this.head.rotation.x = -s.pitch * 0.85;
     this.head.rotation.y = delta * 0.35;

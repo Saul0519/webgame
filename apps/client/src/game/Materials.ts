@@ -41,7 +41,7 @@ function fbm(x: number, y: number, octaves: number, basePeriod: number, seed: nu
   return sum / norm;
 }
 
-const SIZE = 256;
+
 
 interface SurfaceRecipe {
   /** height/roughness/albedo generator; uv in 0..1, returns [r,g,b,height]. */
@@ -127,8 +127,8 @@ const RECIPES: Partial<Record<Surface, SurfaceRecipe>> = {
   },
 };
 
-function buildMaps(recipe: SurfaceRecipe): { map: THREE.DataTexture; rough: THREE.DataTexture; normal: THREE.DataTexture } {
-  const n = SIZE;
+function buildMaps(recipe: SurfaceRecipe, size: number, wantNormal: boolean): { map: THREE.DataTexture; rough: THREE.DataTexture; normal: THREE.DataTexture | null } {
+  const n = size;
   const albedo = new Uint8Array(n * n * 4);
   const rough = new Uint8Array(n * n * 4);
   const height = new Float32Array(n * n);
@@ -149,6 +149,24 @@ function buildMaps(recipe: SurfaceRecipe): { map: THREE.DataTexture; rough: THRE
       rough[i * 4 + 2] = 0;
       rough[i * 4 + 3] = 255;
     }
+  }
+
+  const mk = (data: Uint8Array, srgb: boolean, aniso: number) => {
+    const t = new THREE.DataTexture(data, n, n, THREE.RGBAFormat);
+    t.wrapS = THREE.RepeatWrapping;
+    t.wrapT = THREE.RepeatWrapping;
+    t.magFilter = THREE.LinearFilter;
+    t.minFilter = THREE.LinearMipmapLinearFilter;
+    t.generateMipmaps = true;
+    t.anisotropy = aniso;
+    if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+    t.needsUpdate = true;
+    return t;
+  };
+  const aniso = wantNormal ? 8 : 2;
+
+  if (!wantNormal) {
+    return { map: mk(albedo, true, aniso), rough: mk(rough, false, aniso), normal: null };
   }
 
   // Sobel the height field into a tangent-space normal map.
@@ -177,39 +195,37 @@ function buildMaps(recipe: SurfaceRecipe): { map: THREE.DataTexture; rough: THRE
     }
   }
 
-  const mk = (data: Uint8Array, srgb: boolean) => {
-    const t = new THREE.DataTexture(data, n, n, THREE.RGBAFormat);
-    t.wrapS = THREE.RepeatWrapping;
-    t.wrapT = THREE.RepeatWrapping;
-    t.magFilter = THREE.LinearFilter;
-    t.minFilter = THREE.LinearMipmapLinearFilter;
-    t.generateMipmaps = true;
-    t.anisotropy = 8;
-    if (srgb) t.colorSpace = THREE.SRGBColorSpace;
-    t.needsUpdate = true;
-    return t;
-  };
-
-  return { map: mk(albedo, true), rough: mk(rough, false), normal: mk(normal, false) };
+  return { map: mk(albedo, true, aniso), rough: mk(rough, false, aniso), normal: mk(normal, false, aniso) };
 }
 
 export type SurfaceMaterials = Map<Surface, THREE.MeshStandardMaterial>;
 
-export function buildSurfaceMaterials(): SurfaceMaterials {
+/**
+ * Generating five 256px PBR sets costs a noticeable chunk of the loading time
+ * and a chunk of VRAM, so the low tier halves the resolution and drops normal
+ * maps entirely — the arena still reads as built architecture, just flatter.
+ */
+export function buildSurfaceMaterials(quality: 'low' | 'medium' | 'high' = 'high'): SurfaceMaterials {
+  const size = quality === 'low' ? 128 : 256;
+  const wantNormal = quality !== 'low';
   const out: SurfaceMaterials = new Map();
   for (const key of Object.keys(RECIPES)) {
     const surf = Number(key) as Surface;
     const recipe = RECIPES[surf]!;
-    const { map, rough, normal } = buildMaps(recipe);
-    const mat = new THREE.MeshStandardMaterial({
-      map,
-      roughnessMap: rough,
-      normalMap: recipe.normalScale > 0 ? normal : null,
-      normalScale: new THREE.Vector2(1, 1),
-      metalness: recipe.metalness,
-      roughness: 1.0,
-      envMapIntensity: 1.0,
-    });
+    const { map, rough, normal } = buildMaps(recipe, size, wantNormal && recipe.normalScale > 0);
+    // Lambert shades far more cheaply than the full metallic-roughness model and
+    // is the difference between playable and not on integrated graphics.
+    const mat = quality === 'low'
+      ? (new THREE.MeshLambertMaterial({ map, envMapIntensity: 0.6 }) as unknown as THREE.MeshStandardMaterial)
+      : new THREE.MeshStandardMaterial({
+          map,
+          roughnessMap: rough,
+          normalMap: normal,
+          normalScale: new THREE.Vector2(1, 1),
+          metalness: recipe.metalness,
+          roughness: 1.0,
+          envMapIntensity: 1.0,
+        });
     if (recipe.emissive !== undefined) {
       mat.emissive = new THREE.Color(recipe.emissive);
       mat.emissiveIntensity = recipe.emissiveIntensity ?? 2;

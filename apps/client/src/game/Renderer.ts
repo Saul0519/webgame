@@ -10,6 +10,29 @@ import type { GameMap } from '@webgame/shared';
 
 export type Quality = 'low' | 'medium' | 'high';
 
+/**
+ * How hard each tier pushes the GPU. `low` skips the post chain and shadows
+ * entirely and renders below native resolution, which is what makes integrated
+ * graphics playable; `high` is the full pipeline.
+ */
+interface Tier {
+  post: boolean;
+  bloom: boolean;
+  smaa: boolean;
+  shadows: boolean;
+  shadowMapSize: number;
+  maxPixelRatio: number;
+}
+
+const TIERS: Record<Quality, Tier> = {
+  low: { post: false, bloom: false, smaa: false, shadows: false, shadowMapSize: 512, maxPixelRatio: 1 },
+  medium: { post: true, bloom: true, smaa: false, shadows: true, shadowMapSize: 1024, maxPixelRatio: 1.25 },
+  high: { post: true, bloom: true, smaa: true, shadows: true, shadowMapSize: 2048, maxPixelRatio: 2 },
+};
+
+/** Dynamic resolution never drops below this fraction of the chosen scale. */
+const MIN_DYNAMIC_SCALE = 0.55;
+
 /** Sky dome radius. Must stay inside the camera far plane or the backdrop and
  * the IBL capture both clip away to black. */
 const SKY_RADIUS = 900;
@@ -82,7 +105,18 @@ export class RenderSystem {
   private readonly sunDir = new THREE.Vector3(-0.4, -0.7, -0.6);
   private envRT: THREE.WebGLRenderTarget | null = null;
   private quality: Quality = 'high';
+  private tier: Tier = TIERS.high;
+  /** User-chosen resolution scale (0.5..1). */
+  private baseScale = 1;
+  /** Extra scale applied by the dynamic-resolution governor. */
+  private dynamicScale = 1;
+  private dynamicEnabled = true;
+  private frameMs = 16.7;
+  private lastScaleCheck = 0;
+  private lastFrameStamp = 0;
   private time = 0;
+  private vmScene: THREE.Scene | null = null;
+  private vmCamera: THREE.Camera | null = null;
 
   constructor(container: HTMLElement, fov: number) {
     this.canvas = document.createElement('canvas');
@@ -97,7 +131,7 @@ export class RenderSystem {
     });
     this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 0.72;
+    this.renderer.toneMappingExposure = 0.58;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.info.autoReset = false;
@@ -109,8 +143,14 @@ export class RenderSystem {
     this.scene.add(this.sun.target);
   }
 
-  /** Set up sky, lighting, fog and IBL for a specific map. */
-  applyMap(map: GameMap): void {
+  /**
+   * Set up sky, lighting, fog and IBL for a specific map. The low tier skips the
+   * atmospheric sky dome and the fixture lights: both are per-fragment costs
+   * that dominate on weak GPUs, and the sun plus image-based lighting already
+   * carries the scene.
+   */
+  applyMap(map: GameMap, quality: Quality = 'high'): void {
+    const lowSpec = quality === 'low';
     const [dx, dy, dz] = map.sun.dir;
     const sunPos = new THREE.Vector3(-dx, -dy, -dz).normalize();
 
@@ -119,13 +159,19 @@ export class RenderSystem {
     const sky = new Sky();
     sky.scale.setScalar(SKY_RADIUS);
     const u = sky.material.uniforms;
-    u.turbidity.value = 4.5;
-    u.rayleigh.value = 1.6;
+    u.turbidity.value = 6.5;
+    u.rayleigh.value = 1.1;
     u.mieCoefficient.value = 0.006;
     u.mieDirectionalG.value = 0.82;
     sky.material.toneMapped = true;
     u.sunPosition.value.copy(sunPos);
-    this.scene.add(sky);
+    if (lowSpec) {
+      sky.geometry.dispose();
+      sky.material.dispose();
+      this.scene.background = new THREE.Color(0x6b7d91);
+    } else {
+      this.scene.add(sky);
+    }
 
     // IBL comes from a hand-built gradient rather than from prefiltering the sky
     // itself: the physical sky's solar disc exceeds half-float range, and the
@@ -136,7 +182,7 @@ export class RenderSystem {
     this.envRT?.dispose();
     this.envRT = pmrem.fromEquirectangular(envTex);
     this.scene.environment = this.envRT.texture;
-    this.scene.environmentIntensity = 0.5;
+    this.scene.environmentIntensity = lowSpec ? 0.65 : 0.5;
     pmrem.dispose();
     envTex.dispose();
 
@@ -160,34 +206,111 @@ export class RenderSystem {
     this.sun.shadow.normalBias = 0.035;
 
     // Fill lights from the map definition (no shadows: too costly for many).
-    for (const l of map.lights) {
-      const pl = new THREE.PointLight(l.color, l.intensity * 0.3, l.distance, 2);
-      pl.position.set(l.pos[0], l.pos[1], l.pos[2]);
-      this.scene.add(pl);
+    if (!lowSpec) {
+      for (const l of map.lights) {
+        const pl = new THREE.PointLight(l.color, l.intensity * 0.3, l.distance, 2);
+        pl.position.set(l.pos[0], l.pos[1], l.pos[2]);
+        this.scene.add(pl);
+      }
     }
 
-    const hemi = new THREE.HemisphereLight(0xbcd4ff, 0x2a2620, 0.22);
+    const hemi = new THREE.HemisphereLight(0xbcd4ff, 0x2a2620, lowSpec ? 0.34 : 0.22);
     this.scene.add(hemi);
   }
 
   setQuality(q: Quality, vmScene?: THREE.Scene, vmCamera?: THREE.Camera): void {
     this.quality = q;
-    this.renderer.shadowMap.enabled = q !== 'low';
-    const shadowSize = q === 'high' ? 2048 : 1024;
-    this.sun.shadow.mapSize.set(shadowSize, shadowSize);
+    this.tier = TIERS[q];
+    if (vmScene) this.vmScene = vmScene;
+    if (vmCamera) this.vmCamera = vmCamera;
+
+    this.renderer.shadowMap.enabled = this.tier.shadows;
+    this.sun.castShadow = this.tier.shadows;
+    this.sun.shadow.mapSize.set(this.tier.shadowMapSize, this.tier.shadowMapSize);
     this.sun.shadow.map?.dispose();
     this.sun.shadow.map = null as unknown as THREE.WebGLRenderTarget;
-    this.renderer.setPixelRatio(q === 'low' ? 1 : Math.min(devicePixelRatio, q === 'high' ? 2 : 1.5));
-    this.buildComposer(vmScene, vmCamera);
+
+    this.dynamicScale = 1;
+    this.applyPixelRatio();
+    this.buildComposer(this.vmScene ?? undefined, this.vmCamera ?? undefined);
     this.resize();
+  }
+
+  /** 0.5..1: renders below native resolution and upscales. */
+  setRenderScale(scale: number): void {
+    this.baseScale = Math.max(0.5, Math.min(1, scale));
+    this.dynamicScale = 1;
+    this.applyPixelRatio();
+    this.resize();
+  }
+
+  setDynamicResolution(on: boolean): void {
+    this.dynamicEnabled = on;
+    if (!on) {
+      this.dynamicScale = 1;
+      this.applyPixelRatio();
+      this.resize();
+    }
+  }
+
+  private applyPixelRatio(): void {
+    const dpr = Math.min(window.devicePixelRatio || 1, this.tier.maxPixelRatio);
+    this.renderer.setPixelRatio(Math.max(0.4, dpr * this.baseScale * this.dynamicScale));
+  }
+
+  /**
+   * Hold a playable frame rate by trading resolution for speed.
+   *
+   * Everything here is measured against the wall clock rather than the frame
+   * counter. An EMA weighted per frame converges in *frames*, so on the slow
+   * machines this exists for it would take half a minute to notice — and the
+   * simulation's own delta is clamped, which hides long stalls entirely.
+   */
+  private governResolution(): void {
+    const now = performance.now();
+    if (this.lastFrameStamp === 0) {
+      this.lastFrameStamp = now;
+      this.lastScaleCheck = now;
+      return;
+    }
+    const raw = Math.min(1000, now - this.lastFrameStamp);
+    this.lastFrameStamp = now;
+    // Time-weighted smoothing: ~0.4s to converge at any frame rate.
+    this.frameMs += (raw - this.frameMs) * Math.min(1, raw / 400);
+
+    if (!this.dynamicEnabled) return;
+    if (now - this.lastScaleCheck < 700) return;
+    this.lastScaleCheck = now;
+
+    // Cost scales with pixel count, so the scale correction is a square root.
+    const target = 1000 / 60;
+    if (this.frameMs < 13 && this.dynamicScale >= 1) return;
+    if (this.frameMs >= 13 && this.frameMs <= 20) return;
+
+    const wanted = this.dynamicScale * Math.sqrt(target / this.frameMs);
+    const stepped = Math.max(this.dynamicScale - 0.2, Math.min(this.dynamicScale + 0.1, wanted));
+    const next = Math.max(MIN_DYNAMIC_SCALE, Math.min(1, stepped));
+    if (Math.abs(next - this.dynamicScale) < 0.02) return;
+    this.dynamicScale = next;
+    this.applyPixelRatio();
+    this.resize();
+  }
+
+  get fps(): number {
+    return Math.round(1000 / Math.max(1, this.frameMs));
+  }
+
+  get resolutionScale(): number {
+    return this.baseScale * this.dynamicScale;
   }
 
   private buildComposer(vmScene?: THREE.Scene, vmCamera?: THREE.Camera): void {
     this.composer?.dispose();
-    if (this.quality === 'low') {
+    if (!this.tier.post) {
       this.composer = null;
       this.vmPass = null;
       this.gradePass = null;
+      this.bloom = null;
       return;
     }
     const composer = new EffectComposer(this.renderer);
@@ -205,16 +328,20 @@ export class RenderSystem {
       this.vmPass = null;
     }
 
-    const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), this.quality === 'high' ? 0.22 : 0.16, 0.55, 1.0);
-    composer.addPass(bloom);
-    this.bloom = bloom;
+    if (this.tier.bloom) {
+      const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), this.quality === 'high' ? 0.22 : 0.16, 0.55, 1.0);
+      composer.addPass(bloom);
+      this.bloom = bloom;
+    } else {
+      this.bloom = null;
+    }
 
     const grade = new ShaderPass(GradeShader);
     composer.addPass(grade);
     this.gradePass = grade;
 
     composer.addPass(new OutputPass());
-    if (this.quality === 'high') composer.addPass(new SMAAPass());
+    if (this.tier.smaa) composer.addPass(new SMAAPass());
     this.composer = composer;
   }
 
@@ -240,6 +367,7 @@ export class RenderSystem {
   render(dt: number, vmScene: THREE.Scene, vmCamera: THREE.Camera): void {
     this.time += dt;
     this.renderer.info.reset();
+    this.governResolution();
     // Keep the sun rig centred on the player so the shadow map stays tight.
     const focusX = this.camera.position.x;
     const focusZ = this.camera.position.z;
@@ -302,7 +430,7 @@ function buildSkyEnvTexture(sunDir: THREE.Vector3, sunColour: THREE.Color): THRE
         r = zenith.r + (horizon.r - zenith.r) * t;
         g = zenith.g + (horizon.g - zenith.g) * t;
         b = zenith.b + (horizon.b - zenith.b) * t;
-        const scale = 0.85 + t * 0.65;
+        const scale = 0.7 + t * 0.45;
         r *= scale;
         g *= scale;
         b *= scale;
@@ -318,7 +446,7 @@ function buildSkyEnvTexture(sunDir: THREE.Vector3, sunColour: THREE.Color): THRE
       // Broad, bounded sun lobe: enough to give speculars a direction without
       // any single texel blowing past what a half-float can hold.
       const d = Math.max(0, dx * sunDir.x + dy * sunDir.y + dz * sunDir.z);
-      const lobe = Math.pow(d, 220) * 6 + Math.pow(d, 12) * 0.9;
+      const lobe = Math.pow(d, 220) * 3.2 + Math.pow(d, 12) * 0.55;
       r += sunColour.r * lobe;
       g += sunColour.g * lobe;
       b += sunColour.b * lobe;

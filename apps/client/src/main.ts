@@ -19,7 +19,7 @@ const menu = new Menu(app, async ({ room, settings, offline, fillTo }: StartRequ
   // and geometry build blocks the main thread.
   await new Promise((r) => setTimeout(r, 30));
 
-  const g = new Game(app, hud, { ...settings, offline, fillTo }, (reason) => {
+  const g = new Game(app, hud, { ...settings, offline, fillTo, botSkill: settings.botSkill }, (reason) => {
     g.dispose();
     game = null;
     hud.hide();
@@ -27,7 +27,7 @@ const menu = new Menu(app, async ({ room, settings, offline, fillTo }: StartRequ
   });
 
   try {
-    await g.connect(room, settings.name);
+    await g.connect(room, settings.name, fillTo);
   } catch (err) {
     g.dispose();
     loading.classList.add('hidden');

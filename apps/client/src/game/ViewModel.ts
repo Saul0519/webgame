@@ -254,10 +254,10 @@ export class ViewModel {
     const { lookDx, lookDy, speed, grounded, ads } = opts;
 
     // Sway trails the mouse, then springs back.
-    this.swayX += (-lookDx * 0.9 - this.swayX) * Math.min(1, 12 * dt);
-    this.swayY += (-lookDy * 0.9 - this.swayY) * Math.min(1, 12 * dt);
-    this.swayX *= 1 - Math.min(1, 4 * dt);
-    this.swayY *= 1 - Math.min(1, 4 * dt);
+    this.swayX += (-lookDx * 0.45 - this.swayX) * Math.min(1, 26 * dt);
+    this.swayY += (-lookDy * 0.45 - this.swayY) * Math.min(1, 26 * dt);
+    this.swayX *= 1 - Math.min(1, 9 * dt);
+    this.swayY *= 1 - Math.min(1, 9 * dt);
 
     this.adsT += (ads - this.adsT) * Math.min(1, 16 * dt);
     const adsEase = this.adsT * this.adsT * (3 - 2 * this.adsT);

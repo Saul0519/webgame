@@ -42,7 +42,8 @@ function inputMsg(firstSeq, inputs, rewind) {
 
 function connect(name) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`${BASE.replace(/^http/, 'ws')}/ws?room=${code}&name=${name}`);
+    // bots=0 keeps the room to just these two clients so the assertions are stable.
+    const ws = new WebSocket(`${BASE.replace(/^http/, 'ws')}/ws?room=${code}&name=${name}&bots=0`);
     ws.binaryType = 'arraybuffer';
     const state = { ws, id: 0, snapshots: 0, events: [], last: null, ammo: -1, seq: 1, all: new Map() };
     ws.onerror = (e) => reject(new Error('ws error'));

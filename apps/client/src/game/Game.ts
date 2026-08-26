@@ -27,11 +27,12 @@ import { LocalConnection } from '../net/LocalConnection.js';
 import { RenderSystem, type Quality } from './Renderer.js';
 import { buildSurfaceMaterials } from './Materials.js';
 import { buildLevel } from './LevelBuilder.js';
-import { CharacterModel } from './CharacterModel.js';
+import { CharacterModel, setCharacterQuality } from './CharacterModel.js';
 import { ViewModel } from './ViewModel.js';
 import { Effects } from './Effects.js';
 import { AudioEngine } from './AudioEngine.js';
 import type { Hud, ScoreRow } from '../ui/Hud.js';
+import { Minimap } from '../ui/Minimap.js';
 
 const BASE_FOV = 92;
 /** The viewmodel renders through a narrower lens than the world, the usual
@@ -75,6 +76,10 @@ export interface GameOptions {
   name: string;
   /** Host the match in this tab instead of connecting to a server. */
   offline?: boolean;
+  /** 0.5..1 — render below native resolution and upscale. */
+  renderScale?: number;
+  /** Let the renderer trade resolution for frame rate automatically. */
+  dynamicResolution?: boolean;
   /** Total participants (including you) when bots fill the match. */
   fillTo?: number;
   botSkill?: number;
@@ -86,6 +91,7 @@ export class Game {
   private readonly effects: Effects;
   private readonly audio = new AudioEngine();
   private readonly hud: Hud;
+  private readonly minimap: Minimap;
   private conn: GameConnection;
   readonly offline: boolean;
   private map: GameMap;
@@ -150,18 +156,22 @@ export class Game {
     this.local = createMoveState(0, 1, 0);
 
     this.render = new RenderSystem(container, BASE_FOV);
-    this.render.applyMap(this.map);
+    setCharacterQuality(opts.quality);
+    this.render.applyMap(this.map, opts.quality);
 
-    const materials = buildSurfaceMaterials();
+    const materials = buildSurfaceMaterials(opts.quality);
     const level = buildLevel(this.map, materials);
     this.render.scene.add(level.group);
 
     this.vm = new ViewModel(BASE_FOV * VM_FOV_RATIO);
     this.vm.setEnvironment(this.render.environment);
+    this.render.setRenderScale(opts.renderScale ?? 1);
+    this.render.setDynamicResolution(opts.dynamicResolution !== false);
     this.render.setQuality(opts.quality, this.vm.scene, this.vm.camera);
     this.render.resize();
 
     this.effects = new Effects(this.render.scene);
+    this.minimap = new Minimap(hud.root, this.map);
 
     const handlers = {
       onWelcome: (w: { playerId: number; roster: { id: number; name: string }[] }) =>
@@ -184,8 +194,8 @@ export class Game {
     return { render: this.render, vm: this.vm, local: this.local };
   }
 
-  async connect(room: string, name: string): Promise<void> {
-    await this.conn.connect(room, name);
+  async connect(room: string, name: string, bots?: number): Promise<void> {
+    await this.conn.connect(room, name, bots);
     this.audio.ensure();
   }
 
@@ -203,7 +213,7 @@ export class Game {
     cancelAnimationFrame(this.frameHandle);
     window.removeEventListener('resize', this.handleResize);
     document.removeEventListener('pointerlockchange', this.handlePointerLock);
-    document.removeEventListener('mousemove', this.handleMouseMove);
+    document.removeEventListener('pointermove', this.handlePointerMove);
     window.removeEventListener('keydown', this.handleKeyDown);
     window.removeEventListener('keyup', this.handleKeyUp);
     window.removeEventListener('mousedown', this.handleMouseDown);
@@ -226,7 +236,7 @@ export class Game {
       }
     });
     document.addEventListener('pointerlockchange', this.handlePointerLock);
-    document.addEventListener('mousemove', this.handleMouseMove);
+    document.addEventListener('pointermove', this.handlePointerMove);
     window.addEventListener('keydown', this.handleKeyDown);
     window.addEventListener('keyup', this.handleKeyUp);
     window.addEventListener('mousedown', this.handleMouseDown);
@@ -247,14 +257,31 @@ export class Game {
     }
   };
 
-  private handleMouseMove = (e: MouseEvent): void => {
+  /**
+   * Browsers coalesce pointer events to one per frame. At low frame rates that
+   * throws away real mouse samples and makes aiming feel like it arrives late,
+   * so pull the sub-frame history back out where the browser offers it.
+   */
+  private handlePointerMove = (e: PointerEvent): void => {
     if (!this.locked) return;
+    let dx = 0;
+    let dy = 0;
+    const coalesced = typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : null;
+    if (coalesced && coalesced.length > 0) {
+      for (const c of coalesced) {
+        dx += c.movementX;
+        dy += c.movementY;
+      }
+    } else {
+      dx = e.movementX;
+      dy = e.movementY;
+    }
     const s = this.sensitivity * 0.0022;
-    this.yaw -= e.movementX * s;
-    this.pitch -= e.movementY * s;
+    this.yaw -= dx * s;
+    this.pitch -= dy * s;
     this.pitch = Math.max(-1.5533, Math.min(1.5533, this.pitch));
-    this.lookDx += e.movementX * 0.001;
-    this.lookDy += e.movementY * 0.001;
+    this.lookDx += dx * 0.001;
+    this.lookDy += dy * 0.001;
   };
 
   private handleMouseDown = (e: MouseEvent): void => {
@@ -288,6 +315,10 @@ export class Game {
       return;
     }
     if (e.code === 'KeyM') {
+      this.minimap.cycle();
+      return;
+    }
+    if (e.code === 'KeyO') {
       this.audio.setMuted(!this.audio.isMuted);
       this.hud.showToast(this.audio.isMuted ? 'Audio muted' : 'Audio on');
       return;
@@ -548,6 +579,7 @@ export class Game {
 
   private onShotEvent(ev: Extract<GameEvent, { t: 'shot' }>): void {
     if (ev.id === this.selfId) return; // already predicted locally
+    this.minimap.ping(ev.x, ev.z);
     const hit = this.world.raycast(ev.x, ev.y, ev.z, ev.dx, ev.dy, ev.dz, 200);
     const dist = hit ? hit.t : 60;
     this.effects.spawnTracer(
@@ -589,6 +621,7 @@ export class Game {
     this.updateCamera(dt);
     this.updateViewModel(dt);
     this.effects.update(dt, this.render.camera);
+    this.minimap.draw(this.local.x, this.local.z, this.yaw, this.dead);
     this.updateHud(dt);
 
     this.render.render(dt, this.vm.scene, this.vm.camera);
@@ -850,9 +883,9 @@ export class Game {
     this.hud.setMatch(this.matchRemaining, this.matchKillLimit, this.intermission, leader);
 
     this.hud.setNetStat([
+      `${this.render.fps} fps  ${Math.round(this.render.resolutionScale * 100)}%`,
       this.offline ? 'offline match' : `${Math.round(this.conn.rttMs)} ms rtt`,
-      `${TICK_MS.toFixed(1)} ms tick`,
-      `${this.render.drawCalls} draws`,
+      `${TICK_MS.toFixed(1)} ms tick  ${this.render.drawCalls} draws`,
       `${this.remotes.size + 1} players`,
     ]);
 

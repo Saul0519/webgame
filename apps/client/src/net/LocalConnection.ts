@@ -37,9 +37,9 @@ export class LocalConnection implements GameConnection {
     return this.room !== null && !this.closed;
   }
 
-  async connect(_room: string, name: string): Promise<void> {
+  async connect(_room: string, name: string, bots?: number): Promise<void> {
     const room = new MatchRoom({
-      fillTo: Math.max(2, this.opts.fillTo),
+      fillTo: bots === undefined ? this.opts.fillTo : Math.max(0, bots),
       botSkill: this.opts.botSkill,
       seed: (Math.floor(performance.now() * 1000) ^ 0x2545f491) >>> 0,
     });

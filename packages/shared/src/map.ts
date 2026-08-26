@@ -219,8 +219,8 @@ function buildReactor(): GameMap {
     lights,
     bounds: { min: [-HS - 2, -4, -HS - 2], max: [HS + 2, WALL_H + 2, HS + 2] },
     killZ: -12,
-    sun: { dir: [-0.42, -0.62, -0.66], color: 0xffeacd, intensity: 3.1 },
-    fog: { color: 0x9db3c8, near: 40, far: 190 },
+    sun: { dir: [-0.5, -0.78, -0.38], color: 0xffe9d2, intensity: 2.0 },
+    fog: { color: 0x7d8fa3, near: 40, far: 190 },
   };
 }
 

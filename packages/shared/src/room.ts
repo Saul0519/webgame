@@ -121,7 +121,7 @@ export class MatchRoom {
 
   private readonly players = new Map<number, RoomPlayer>();
   private readonly maxPlayers: number;
-  private readonly fillTo: number;
+  private fillTo: number;
   private readonly botSkill: number;
 
   private tickNo = 0;
@@ -176,6 +176,26 @@ export class MatchRoom {
 
   get isFull(): boolean {
     return this.humanCount >= this.maxPlayers;
+  }
+
+  /**
+   * How many participants bots should top the match up to. Whoever opens an
+   * empty room picks this, so "no bots" is a real option without needing a
+   * separate room type.
+   */
+  setFillTo(n: number): void {
+    const next = Math.max(0, Math.min(n, this.maxPlayers));
+    if (next === this.fillTo) return;
+    this.fillTo = next;
+    this.syncBots();
+  }
+
+  get botCount(): number {
+    return this.players.size - this.humanCount;
+  }
+
+  get fillTarget(): number {
+    return this.fillTo;
   }
 
   info(): Record<string, unknown> {
@@ -258,7 +278,6 @@ export class MatchRoom {
 
   /** Keep the match topped up with bots while at least one human is present. */
   private syncBots(): void {
-    if (this.fillTo <= 0) return;
     const humans = this.humanCount;
     const target = humans > 0 ? Math.max(0, this.fillTo - humans) : 0;
     const bots = [...this.players.values()].filter((p) => !p.transport);

@@ -51,6 +51,12 @@ export class GameRoom implements DurableObject {
       send: (data) => server.send(data),
       close: (code, reason) => server.close(code, reason),
     };
+    // The first person into an empty room decides whether bots fill it out.
+    if (this.room.humanCount === 0) {
+      const wanted = Number(url.searchParams.get('bots'));
+      this.room.setFillTo(Number.isFinite(wanted) && wanted >= 0 ? wanted : FILL_TO);
+    }
+
     const id = this.room.join(transport, url.searchParams.get('name') ?? '');
     if (id === null) return new Response('room full', { status: 503 });
     this.ids.set(server, id);

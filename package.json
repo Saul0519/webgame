@@ -1,0 +1,20 @@
+{
+  "name": "webgame",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Online multiplayer game platform \u2014 FPS first, chess/tetris later. Cloudflare Workers + Durable Objects authoritative servers.",
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm -r --parallel dev",
+    "dev:client": "pnpm --filter @webgame/client dev",
+    "dev:server": "pnpm --filter @webgame/server dev",
+    "build": "pnpm --filter @webgame/shared build && pnpm --filter @webgame/client build",
+    "typecheck": "pnpm -r typecheck",
+    "deploy": "pnpm build && pnpm --filter @webgame/server deploy",
+    "smoke": "node tools/smoke-test.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  },
+  "packageManager": "pnpm@10.33.0"
+}

@@ -110,6 +110,39 @@ cd apps/server && npx wrangler deploy --temporary
 
 Durable Object 마이그레이션은 `v1` 태그로 정의돼 있고, SQLite 백엔드라 무료 플랜에서도 동작합니다.
 
+### 휴대폰만으로 배포하기
+
+터미널 없이 브라우저만으로 됩니다. 둘 중 하나만 하면 됩니다.
+
+**방법 A — Cloudflare 대시보드에서 GitHub 연결 (추천, 시크릿 불필요)**
+
+1. `dash.cloudflare.com` 접속 → 로그인/가입 (무료 플랜으로 충분합니다)
+2. **Compute (Workers)** → **Create** → **Import a repository** → GitHub 연결 → 이 저장소 선택
+3. 브랜치: `claude/multiplayer-fps-game-nxohcu`
+4. 빌드 설정을 아래처럼 넣습니다 — 모노레포라 기본값 그대로는 안 됩니다.
+
+   | 항목 | 값 |
+   | --- | --- |
+   | Root directory | `/` (비워두기) |
+   | Build command | `pnpm install && pnpm --filter @webgame/client build` |
+   | Deploy command | `npx wrangler deploy --config apps/server/wrangler.jsonc` |
+
+5. **Save and Deploy**. 끝나면 `https://webgame.<서브도메인>.workers.dev` 주소가 나옵니다.
+
+이후로는 이 브랜치에 푸시할 때마다 Cloudflare가 알아서 다시 배포합니다.
+
+**방법 B — GitHub Actions (`.github/workflows/deploy.yml` 이미 들어있음)**
+
+1. `dash.cloudflare.com` → 오른쪽 위 프로필 → **API Tokens** → **Create Token**
+   → **Edit Cloudflare Workers** 템플릿 → 생성된 토큰 복사
+2. 같은 대시보드 Workers 페이지 오른쪽에서 **Account ID** 복사
+3. GitHub 저장소 → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
+   - `CLOUDFLARE_API_TOKEN` = 1번 토큰
+   - `CLOUDFLARE_ACCOUNT_ID` = 2번 ID
+4. **Actions** 탭 → *Deploy to Cloudflare* → **Run workflow**
+
+이후 푸시할 때마다 타입체크 → 빌드 → 배포가 자동으로 돌아갑니다.
+
 ### 배포 후 같이 하는 법
 
 1. 나온 주소를 열고 **Quick match** 를 누릅니다.

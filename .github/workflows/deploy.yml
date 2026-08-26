@@ -1,0 +1,40 @@
+name: Deploy to Cloudflare
+
+# Runs on every push to the game branch, and can be started by hand from the
+# GitHub Actions tab (which works fine in a phone browser).
+on:
+  push:
+    branches:
+      - main
+      - claude/multiplayer-fps-game-nxohcu
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Build client
+        run: pnpm --filter @webgame/client build
+
+      - name: Deploy worker
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: apps/server
